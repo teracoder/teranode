@@ -102,12 +102,19 @@ func SetTracingEnabled(enabled bool) {
 func InitTracer(appSettings *settings.Settings) error {
 	once.Do(func() {
 		// Create OTLP exporter
-		var exporter *otlptrace.Exporter
+		var (
+			exporter *otlptrace.Exporter
 
+			opts []otlptracehttp.Option
+		)
+
+		opts = append(opts, otlptracehttp.WithEndpoint(appSettings.TracingCollectorURL.Host))
+		if appSettings.TracingCollectorURL.Scheme == "http" {
+			opts = append(opts, otlptracehttp.WithInsecure())
+		}
 		exporter, initErr = otlptracehttp.New(
 			context.Background(),
-			otlptracehttp.WithEndpoint(appSettings.TracingCollectorURL.String()), // Jaeger OTLP HTTP endpoint
-			otlptracehttp.WithInsecure(),                                         // Use this for HTTP, remove for HTTPS
+			opts...,
 		)
 		if initErr != nil {
 			initErr = errors.NewProcessingError("failed to create OTLP exporter", initErr)
