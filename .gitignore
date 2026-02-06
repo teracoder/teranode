@@ -103,6 +103,6 @@ teranode_peers.json
 *.key
 logs/
 teranode.logrotate
-teranode
+/teranode
 
 settings_local.conf
