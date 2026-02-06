@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": 36,
+  "id": null,
   "links": [],
   "panels": [
     {
@@ -4063,10 +4063,7 @@
         "type": "query"
       },
       {
-        "current": {
-          "text": "In Cluster Prometheus",
-          "value": "P3D067ABEF279A52C"
-        },
+        "current": {},
         "includeAll": false,
         "label": "Prometheus",
         "name": "prometheus",

@@ -14,13 +14,13 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": 0,
+  "id": null,
   "links": [],
   "panels": [
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "P3D067ABEF279A52C"
+        "uid": "${DS_AEROSPIKE_PROMETHEUS}"
       },
       "description": "What Good Looks Like: Low steady numbers (e.g. < 100). If this hits 1024, the system is at max capacity and will reject traffic.",
       "fieldConfig": {
@@ -119,7 +119,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "P3D067ABEF279A52C"
+        "uid": "${DS_AEROSPIKE_PROMETHEUS}"
       },
       "description": "What Good Looks Like: The line should be flat at 0ms. Any spike means requests are sitting in a queue because all threads are busy.",
       "fieldConfig": {
@@ -219,7 +219,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "P3D067ABEF279A52C"
+        "uid": "${DS_AEROSPIKE_PROMETHEUS}"
       },
       "description": "GOOD: Low/Steady. BAD: High spikes mean the buffer pool is physically empty. The node is wasting CPU asking the Linux kernel for more RAM instead of processing data. Adjust with batch-index-max-buffers ",
       "fieldConfig": {
@@ -313,7 +313,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "P3D067ABEF279A52C"
+        "uid": "${DS_AEROSPIKE_PROMETHEUS}"
       },
       "description": "What Good Looks Like: Flat at 0. Large negative bars show the exact moment the burst is draining system resources faster than we can process them.",
       "fieldConfig": {
@@ -408,7 +408,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "P3D067ABEF279A52C"
+        "uid": "${DS_AEROSPIKE_PROMETHEUS}"
       },
       "description": "What Good Looks Like: High 'Success' and zero 'Errors'. If Success drops while Delay (Chart 1) rises, threads are blocked.",
       "fieldConfig": {
@@ -511,7 +511,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "P3D067ABEF279A52C"
+        "uid": "${DS_AEROSPIKE_PROMETHEUS}"
       },
       "description": "GOOD: Zero (Flat line). BAD: Any spike means your batches are exceeding standard buffer size (128KB), forcing slow custom memory allocations. This confirms 'Complexity' is the bottleneck.",
       "fieldConfig": {
@@ -610,10 +610,7 @@
   "templating": {
     "list": [
       {
-        "current": {
-          "text": "In Cluster Prometheus",
-          "value": "P3D067ABEF279A52C"
-        },
+        "current": {},
         "label": "Datasource",
         "name": "DS_AEROSPIKE_PROMETHEUS",
         "options": [],
@@ -623,10 +620,7 @@
         "type": "datasource"
       },
       {
-        "current": {
-          "text": "prometheus/aerospike-pod-monitor",
-          "value": "prometheus/aerospike-pod-monitor"
-        },
+        "current": {},
         "datasource": {
           "type": "prometheus",
           "uid": "${DS_AEROSPIKE_PROMETHEUS}"
@@ -646,10 +640,7 @@
         "type": "query"
       },
       {
-        "current": {
-          "text": "aero-dev-k0s-scale-1",
-          "value": "aero-dev-k0s-scale-1"
-        },
+        "current": {},
         "datasource": {
           "type": "prometheus",
           "uid": "${DS_AEROSPIKE_PROMETHEUS}"
@@ -670,8 +661,8 @@
     ]
   },
   "time": {
-    "from": "2026-02-05T16:01:41.000Z",
-    "to": "2026-02-05T17:32:30.000Z"
+    "from": "now-1h",
+    "to": "now"
   },
   "timepicker": {},
   "timezone": "",
