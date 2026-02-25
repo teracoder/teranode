@@ -589,6 +589,19 @@ func NewSettings(alternativeContext ...string) *Settings {
 			WebSocketPort:  getString("dashboard_websocketPort", "8090", alternativeContext...),
 			WebSocketPath:  getString("dashboard_websocketPath", "/connection/websocket", alternativeContext...),
 		},
+		GRPC: GRPCSettings{
+			HighThroughputMode:       getBool("grpc_high_throughput_mode", false, alternativeContext...),
+			InitialWindowSize:        getInt32("grpc_initial_window_size", 0, alternativeContext...),
+			InitialConnWindowSize:    getInt32("grpc_initial_conn_window_size", 0, alternativeContext...),
+			MaxConcurrentStreams:     getUint32("grpc_max_concurrent_streams", 0, alternativeContext...),
+			ReadBufferSize:           getInt("grpc_read_buffer_size", 0, alternativeContext...),
+			WriteBufferSize:          getInt("grpc_write_buffer_size", 0, alternativeContext...),
+			KeepaliveTime:            getInt("grpc_keepalive_time_seconds", 30, alternativeContext...),
+			KeepaliveTimeout:         getInt("grpc_keepalive_timeout_seconds", 20, alternativeContext...),
+			ServerMinPingTime:        getInt("grpc_server_min_ping_time_seconds", 30, alternativeContext...),
+			PermitWithoutStream:      getBool("grpc_permit_without_stream", true, alternativeContext...),
+			MaxConnectionIdleSeconds: getInt("grpc_max_connection_idle_seconds", 300, alternativeContext...),
+		},
 	}
 }
 
