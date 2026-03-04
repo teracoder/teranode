@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -192,9 +193,15 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/tx/:hash/hex", h.GetTransaction(HEX))
 	apiGroup.GET("/tx/:hash/json", h.GetTransaction(JSON))
 
-	// backwards compatibility for legacy endpoints - remove in future
-	apiGroup.POST("/txs", h.GetTransactions())       // BINARY_STREAM only
-	apiGroup.POST("/:hash/txs", h.GetTransactions()) // BINARY_STREAM only
+	if tSettings.Asset.PropagationProxyEnabled && tSettings.Asset.PropagationProxyAddress != "" {
+		proxyTarget, err := url.Parse(tSettings.Asset.PropagationProxyAddress)
+		if err != nil {
+			logger.Errorf("[Asset] failed to parse propagation proxy address %q: %v", tSettings.Asset.PropagationProxyAddress, err)
+		} else {
+			apiGroup.POST("/tx", h.ProxyPropagationTx(proxyTarget))
+			apiGroup.POST("/txs", h.ProxyPropagationTx(proxyTarget))
+		}
+	}
 
 	apiGroup.GET("/txmeta/:hash/json", h.GetTransactionMeta(JSON))
 
