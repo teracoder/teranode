@@ -377,6 +377,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			HTTPListenAddress:         getString("validator_httpListenAddress", "", alternativeContext...),
 			HTTPAddress:               getURL("validator_httpAddress", "", alternativeContext...),
 			HTTPRateLimit:             getInt("validator_httpRateLimit", 1024, alternativeContext...),
+			HTTPBodyLimit:             getString("validator_httpBodyLimit", "100MB", alternativeContext...),
 			KafkaMaxMessageBytes:      getInt("validator_kafka_maxMessageBytes", 1024*1024, alternativeContext...), // Default 1MB
 			UseLocalValidator:         getBool("useLocalValidator", false, alternativeContext...),
 			TxMetaKafkaBatchSize:      getInt("validator_txmeta_kafka_batchSize", 1024, alternativeContext...),
@@ -563,6 +564,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 		Propagation: PropagationSettings{
 			IPv6Addresses:        getString("ipv6_addresses", "", alternativeContext...),
 			IPv6Interface:        getString("ipv6_interface", "", alternativeContext...),
+			IPv6AllowedSources:   getMultiString("propagation_ipv6_allowed_sources", "|", []string{}, alternativeContext...),
 			GRPCMaxConnectionAge: getDuration("propagation_grpcMaxConnectionAge", 90*time.Second, alternativeContext...),
 			HTTPListenAddress:    getString("propagation_httpListenAddress", "", alternativeContext...),
 			HTTPAddresses:        getMultiString("propagation_httpAddresses", "|", []string{}, alternativeContext...),
@@ -572,6 +574,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SendBatchTimeout:     getInt("propagation_sendBatchTimeout", 5, alternativeContext...),
 			GRPCAddresses:        getMultiString("propagation_grpcAddresses", "|", []string{}, alternativeContext...),
 			GRPCListenAddress:    getString("propagation_grpcListenAddress", "", alternativeContext...),
+			HTTPBodyLimit:        getString("propagation_httpBodyLimit", "100MB", alternativeContext...),
 		},
 		RPC: RPCSettings{
 			RPCUser:           getString("rpc_user", "", alternativeContext...),
@@ -584,6 +587,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CacheEnabled:      getBool("rpc_cache_enabled", true, alternativeContext...),
 			RPCTimeout:        getDuration("rpc_timeout", 30*time.Second, alternativeContext...),
 			ClientCallTimeout: getDuration("rpc_client_call_timeout", 5*time.Second, alternativeContext...),
+			RPCMaxRequestSize: getInt("rpc_maxRequestSize", 10*1024*1024, alternativeContext...), // 10MB
 		},
 		Faucet: FaucetSettings{
 			HTTPListenAddress: getString("faucet_httpListenAddress", "", alternativeContext...),
