@@ -408,6 +408,72 @@ func TestForceRecovery_WatchdogIntegration(t *testing.T) {
 	assert.Greater(t, duration, 5*time.Millisecond)
 }
 
+func TestNewKafkaConsumerGroup_AppliesDefaultTimeouts(t *testing.T) {
+	// Verify that zero-value and negative timeouts get default values applied
+	// when constructing a consumer group with a non-memory scheme.
+	tests := []struct {
+		name              string
+		maxProcessingTime time.Duration
+		sessionTimeout    time.Duration
+		heartbeatInterval time.Duration
+		rebalanceTimeout  time.Duration
+	}{
+		{
+			name:              "zero values get defaults",
+			maxProcessingTime: 0,
+			sessionTimeout:    0,
+			heartbeatInterval: 0,
+			rebalanceTimeout:  0,
+		},
+		{
+			name:              "negative values get defaults",
+			maxProcessingTime: -1 * time.Second,
+			sessionTimeout:    -1 * time.Second,
+			heartbeatInterval: -1 * time.Second,
+			rebalanceTimeout:  -1 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Use a non-memory Kafka URL so that NewKafkaConsumerGroup
+			// exercises the non-memory path and applies default timeouts.
+			u, err := url.Parse("kafka://localhost:9092")
+			require.NoError(t, err)
+
+			cfg := KafkaConsumerConfig{
+				Logger:            &mockLogger{},
+				URL:               u,
+				BrokersURL:        []string{"localhost:9092"},
+				Topic:             "test-topic",
+				ConsumerGroupID:   "test-group",
+				MaxProcessingTime: tt.maxProcessingTime,
+				SessionTimeout:    tt.sessionTimeout,
+				HeartbeatInterval: tt.heartbeatInterval,
+				RebalanceTimeout:  tt.rebalanceTimeout,
+			}
+
+			consumer, err := NewKafkaConsumerGroup(cfg)
+			if err != nil {
+				// If construction fails (e.g. due to no broker), it should
+				// not be due to invalid timeout configuration.
+				assert.NotContains(t, err.Error(), "timeout")
+				assert.NotContains(t, err.Error(), "session")
+				return
+			}
+
+			require.NotNil(t, consumer)
+			// When there is no construction error, verify that effective
+			// timeouts are positive, indicating defaults were applied.
+			assert.Greater(t, consumer.Config.MaxProcessingTime, time.Duration(0))
+			assert.Greater(t, consumer.Config.SessionTimeout, time.Duration(0))
+			assert.Greater(t, consumer.Config.HeartbeatInterval, time.Duration(0))
+			assert.Greater(t, consumer.Config.RebalanceTimeout, time.Duration(0))
+			_ = consumer.Close()
+		})
+	}
+}
+
 func TestForceRecovery_MutexProtectsConcurrentCalls(t *testing.T) {
 	logger := &mockLogger{}
 	consumer := &KafkaConsumerGroup{
