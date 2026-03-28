@@ -259,29 +259,38 @@ func TestConsumeWatchdogMarkConsumeStarted(t *testing.T) {
 	assert.True(t, ok)
 	assert.False(t, startTime.IsZero())
 
-	// Verify that setup called time was reset
-	setupTime, ok := watchdog.setupCalledTime.Load().(time.Time)
-	assert.True(t, ok)
-	assert.True(t, setupTime.IsZero())
+	// Verify that lastSuccessfulPollTime is NOT set (never stored on a fresh watchdog)
+	pollTime, ok := watchdog.lastSuccessfulPollTime.Load().(time.Time)
+	// ok may be false if no value was stored yet — that's expected on first poll
+	assert.True(t, !ok || pollTime.IsZero(), "lastSuccessfulPollTime should be zero/unset on first poll (never set)")
+
+	// Simulate a successful poll cycle, then start a new one
+	watchdog.markPollSucceeded()
+	watchdog.markConsumeStarted()
+
+	// lastSuccessfulPollTime should be preserved from the previous successful poll
+	pollTime, ok = watchdog.lastSuccessfulPollTime.Load().(time.Time)
+	assert.True(t, ok, "lastSuccessfulPollTime should be a time.Time after markPollSucceeded")
+	assert.False(t, pollTime.IsZero(), "lastSuccessfulPollTime should be preserved across polls")
 }
 
-func TestConsumeWatchdogMarkSetupCalled(t *testing.T) {
+func TestConsumeWatchdogMarkPollSucceeded(t *testing.T) {
 	watchdog := &consumeWatchdog{}
 
 	// First mark consume started
 	watchdog.markConsumeStarted()
 	assert.True(t, watchdog.isAttemptingConsume.Load())
 
-	// Then mark setup called
-	watchdog.markSetupCalled()
+	// Then mark poll succeeded
+	watchdog.markPollSucceeded()
 
 	// Verify that the watchdog is no longer attempting to consume
 	assert.False(t, watchdog.isAttemptingConsume.Load())
 
-	// Verify that setup called time was set
-	setupTime, ok := watchdog.setupCalledTime.Load().(time.Time)
+	// Verify that lastSuccessfulPollTime was set
+	pollTime, ok := watchdog.lastSuccessfulPollTime.Load().(time.Time)
 	assert.True(t, ok)
-	assert.False(t, setupTime.IsZero())
+	assert.False(t, pollTime.IsZero())
 }
 
 func TestConsumeWatchdogMarkConsumeEnded(t *testing.T) {
@@ -308,17 +317,17 @@ func TestConsumeWatchdogIsStuckInRefreshMetadata_NotAttempting(t *testing.T) {
 	assert.Equal(t, time.Duration(0), duration)
 }
 
-func TestConsumeWatchdogIsStuckInRefreshMetadata_SetupCalled(t *testing.T) {
+func TestConsumeWatchdogIsStuckInRefreshMetadata_PollSucceeded(t *testing.T) {
 	watchdog := &consumeWatchdog{}
 
 	// Mark consume started
 	watchdog.markConsumeStarted()
 
-	// Wait a bit then mark setup called
+	// Wait a bit then mark poll succeeded
 	time.Sleep(10 * time.Millisecond)
-	watchdog.markSetupCalled()
+	watchdog.markPollSucceeded()
 
-	// Should not be stuck because setup was called
+	// Should not be stuck because poll succeeded
 	stuck, duration := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
 
 	assert.False(t, stuck)
@@ -381,13 +390,57 @@ func TestConsumeWatchdogSequence_NormalFlow(t *testing.T) {
 	// 2. Some time passes (simulating RefreshMetadata)
 	time.Sleep(10 * time.Millisecond)
 
-	// 3. Setup is called successfully
-	watchdog.markSetupCalled()
+	// 3. Poll succeeds
+	watchdog.markPollSucceeded()
 	assert.False(t, watchdog.isAttemptingConsume.Load())
 
 	// 4. Should not be stuck
 	stuck, _ := watchdog.isStuckInRefreshMetadata(5 * time.Millisecond)
 	assert.False(t, stuck)
+}
+
+func TestConsumeWatchdogIdleConsumerNotStuck(t *testing.T) {
+	// After a successful first poll, an idle consumer blocking on PollFetches
+	// should NOT be detected as stuck — hasPolledOnce prevents false positives.
+	watchdog := &consumeWatchdog{}
+
+	// First poll cycle: start -> PollFetches returns -> markPollSucceeded
+	watchdog.markConsumeStarted()
+	watchdog.markPollSucceeded()
+	assert.True(t, watchdog.hasPolledOnce.Load())
+
+	// Second poll cycle: start -> PollFetches blocks (idle, no messages)
+	watchdog.markConsumeStarted()
+	assert.True(t, watchdog.isAttemptingConsume.Load())
+
+	// Regardless of elapsed time, the consumer should NOT be stuck
+	// because hasPolledOnce is true.
+	stuck, _ := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
+	assert.False(t, stuck, "idle consumer after successful poll should not be detected as stuck")
+}
+
+func TestConsumeWatchdogHasPolledOnceResetOnRecovery(t *testing.T) {
+	// After force recovery resets hasPolledOnce, the watchdog should be able
+	// to detect a stuck consumer again if the replacement client also fails.
+	watchdog := &consumeWatchdog{}
+
+	// Successful first poll
+	watchdog.markConsumeStarted()
+	watchdog.markPollSucceeded()
+	assert.True(t, watchdog.hasPolledOnce.Load())
+
+	// Simulate forceRecovery clearing the flag
+	watchdog.hasPolledOnce.Store(false)
+	watchdog.markConsumeEnded()
+
+	// New poll cycle on replacement client that gets stuck.
+	// Set consumeStartTime to the past to exceed the threshold deterministically.
+	watchdog.markConsumeStarted()
+	watchdog.consumeStartTime.Store(time.Now().Add(-20 * time.Millisecond))
+
+	stuck, duration := watchdog.isStuckInRefreshMetadata(10 * time.Millisecond)
+	assert.True(t, stuck, "consumer should be detected as stuck after recovery reset")
+	assert.Greater(t, duration, 10*time.Millisecond)
 }
 
 func TestForceRecovery_WatchdogIntegration(t *testing.T) {
