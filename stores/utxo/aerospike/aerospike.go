@@ -354,11 +354,21 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 	s.lockedBatcher = lockedBatcherInst
 
-	if tSettings.BatcherDrainMode {
+	// Per-batcher drain mode: each batcher can be independently configured.
+	// Drain mode is beneficial for stages that receive bursts (Get, Create)
+	// but harmful for stages where items trickle in one-at-a-time (Spend,
+	// SetLocked) — single-item batches trigger Aerospike executeSingle fallback.
+	if tSettings.UtxoStore.GetBatcherDrainMode {
 		s.getBatcher.SetDrainMode(true)
+	}
+	if tSettings.UtxoStore.SpendBatcherDrainMode {
 		s.spendBatcher.SetDrainMode(true)
-		s.lockedBatcher.SetDrainMode(true)
+	}
+	if tSettings.UtxoStore.StoreBatcherDrainMode {
 		s.storeBatcher.SetDrainMode(true)
+	}
+	if tSettings.UtxoStore.LockedBatcherDrainMode {
+		s.lockedBatcher.SetDrainMode(true)
 	}
 
 	logger.Infof("[Aerospike] map txmeta store initialised with namespace: %s, set: %s", namespace, setName)
