@@ -1,6 +1,8 @@
 package uaerospike
 
 import (
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -828,6 +830,154 @@ func asErr(e aerospike.Error) error {
 	}
 	return e
 }
+
+// TestQuerySemaphore_ConcurrentQueryLimit verifies the core contract of the
+// query semaphore: when N permits are held, an (N+1)th acquirer blocks until
+// one of the in-flight permits is released. This is the behaviour the whole
+// feature exists for -- preventing more than N concurrent long-running scans.
+func TestQuerySemaphore_ConcurrentQueryLimit(t *testing.T) {
+	const limit = 3
+
+	client := &Client{
+		connSemaphore: make(chan struct{}, 16),
+		stats:         NewClientStats(),
+	}
+	client.EnableQuerySemaphore(limit)
+	sem := client.loadQuerySemaphore()
+	require.NotNil(t, sem)
+
+	// Hold all `limit` permits.
+	for i := 0; i < limit; i++ {
+		require.NoError(t, asErr(acquireSemaphore(sem, 0)))
+	}
+
+	// An (N+1)th acquire with timeout must fail because all permits are held.
+	start := time.Now()
+	err := acquireSemaphore(sem, 200*time.Millisecond)
+	require.Error(t, asErr(err))
+	require.GreaterOrEqual(t, time.Since(start), minSemaphoreTimeout)
+
+	// Now release one permit and confirm a new acquire succeeds promptly.
+	released := make(chan struct{})
+	go func() {
+		// Block briefly so the waiter below is parked on the channel before
+		// the slot is freed -- this exercises the wakeup path, not just a
+		// fast-path acquire on a free slot.
+		time.Sleep(20 * time.Millisecond)
+		<-sem
+		close(released)
+	}()
+
+	acquired := make(chan struct{})
+	go func() {
+		require.NoError(t, asErr(acquireSemaphore(sem, 500*time.Millisecond)))
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+	case <-time.After(1 * time.Second):
+		t.Fatal("acquire did not unblock after a permit was released")
+	}
+	<-released
+
+	// Drain remaining permits to leave the semaphore clean.
+	<-sem
+	<-sem
+	<-sem
+}
+
+// TestQuerySemaphore_GoroutineCleanup verifies that the release goroutine used
+// by QueryPartitions does not leak: after it observes IsActive()==false and
+// releases the permit, the goroutine count returns to baseline.
+//
+// We can't directly invoke QueryPartitions in a unit test because
+// *aerospike.Recordset has no public constructor, so we exercise the same
+// goroutine pattern the wrapper uses: spawn a release goroutine that polls a
+// stand-in IsActive function, then flip it to false and wait for cleanup.
+func TestQuerySemaphore_GoroutineCleanup(t *testing.T) {
+	client := &Client{
+		connSemaphore: make(chan struct{}, 8),
+		stats:         NewClientStats(),
+	}
+	client.EnableQuerySemaphore(2)
+	sem := client.loadQuerySemaphore()
+	require.NotNil(t, sem)
+
+	const cycles = 20
+	baseline := runtime.NumGoroutine()
+
+	for i := 0; i < cycles; i++ {
+		require.NoError(t, asErr(acquireSemaphore(sem, 0)))
+
+		var active atomic.Bool
+		active.Store(true)
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			waitForRecordsetInactive(active.Load, 5*time.Millisecond)
+			<-sem
+			client.stats.queryStat.AddTime(time.Now())
+		}()
+
+		// Simulate the recordset finishing.
+		active.Store(false)
+		wg.Wait()
+	}
+
+	// Give the runtime a moment to schedule any tail-end work, then assert
+	// goroutine count has returned to baseline (within a small tolerance for
+	// runtime workers that may cycle independently).
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		current := runtime.NumGoroutine()
+		if current <= baseline+1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine leak after %d cycles: baseline=%d current=%d", cycles, baseline, current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Semaphore must be empty -- if any cycle leaked a permit, the channel
+	// length would be non-zero here.
+	assert.Empty(t, sem, "permit leaked: query semaphore should be empty after all cycles")
+}
+
+// TestQuerySemaphore_RepeatedAcquireRelease verifies that the semaphore can be
+// driven through many acquire/release cycles without drift. A subtle off-by-one
+// in the release path (e.g. releasing the wrong channel after a hypothetical
+// reconfiguration, or double-release) would surface as a permit count that
+// disagrees with the channel buffer.
+func TestQuerySemaphore_RepeatedAcquireRelease(t *testing.T) {
+	client := &Client{
+		connSemaphore: make(chan struct{}, 16),
+		stats:         NewClientStats(),
+	}
+	client.EnableQuerySemaphore(4)
+	sem := client.loadQuerySemaphore()
+	require.NotNil(t, sem)
+
+	const iterations = 1_000
+	for i := 0; i < iterations; i++ {
+		require.NoError(t, asErr(acquireSemaphore(sem, 0)))
+		<-sem
+	}
+
+	assert.Empty(t, sem, "permit drift after %d cycles", iterations)
+	assert.Equal(t, 4, cap(sem), "capacity must not change across cycles")
+}
+
+// Note on integration coverage: the recordset-coupled scenarios -- early
+// termination via Close() before consuming, and full consumption to channel
+// close -- require an *aerospike.Recordset, which has no public constructor.
+// They belong in stores/utxo/aerospike/ alongside the existing TestContainers
+// integration tests (e.g. aerospike_test.go) where a real recordset is
+// available. The unit tests above cover the semaphore mechanics and the
+// release-goroutine lifecycle that those integration tests would exercise.
 
 // Test mock functionality separately
 func TestMockAerospikeClient_CompleteCoverage(t *testing.T) {
