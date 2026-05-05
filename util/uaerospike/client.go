@@ -17,6 +17,13 @@ const (
 	// if not specified in the client policy
 	DefaultConnectionQueueSize = 128
 
+	// DefaultQuerySemaphoreFraction is the default fraction of ConnectionQueueSize to use
+	// for the query semaphore when EnableQuerySemaphore is called without an explicit size.
+	// Long-running operations (Query, QueryPartitions) hold connections for the entire
+	// streaming duration (potentially minutes), so they get a smaller dedicated budget
+	// to prevent starving short-lived operations.
+	DefaultQuerySemaphoreFraction = 0.25 // 25% of pool for long-running ops
+
 	// semaphoreTimeoutFraction is the fraction of TotalTimeout to use for semaphore acquisition
 	// This ensures the total operation time (semaphore wait + actual operation) stays within bounds
 	semaphoreTimeoutFraction = 0.1 // 10% of total timeout
@@ -51,11 +58,21 @@ func NewClientStats() *ClientStats {
 	}
 }
 
-// Client is a wrapper around aerospike.Client that provides a semaphore to limit concurrent connections.
+// Client is a wrapper around aerospike.Client that provides semaphores to limit concurrent connections.
+//
+// connSemaphore gates short-lived point operations (Get, Put, Delete, Operate, BatchOperate, Execute).
+// It is always initialized and sized to ConnectionQueueSize.
+//
+// querySemaphore gates long-running streaming operations (Query, QueryPartitions).
+// It is nil by default -- queries pass through to the native client unbounded (same as
+// previous behavior). Call EnableQuerySemaphore to activate it for services that perform
+// heavy scans (e.g. pruner, consistency scanner). When nil, the native connection pool
+// (LimitConnectionsToQueueSize) is the only concurrency limit for queries.
 type Client struct {
 	*aerospike.Client
-	connSemaphore chan struct{} // Simple channel-based semaphore
-	stats         *ClientStats  // Always initialized, never nil
+	connSemaphore  chan struct{} // Semaphore for short-lived operations (always set)
+	querySemaphore chan struct{} // Semaphore for long-running query/scan operations (nil until enabled)
+	stats          *ClientStats  // Always initialized, never nil
 }
 
 // NewClient creates a new Aerospike client with the specified hostname and port.
@@ -290,49 +307,131 @@ func (c *Client) BatchOperate(policy *aerospike.BatchPolicy, records []aerospike
 	return c.Client.BatchOperate(policy, records)
 }
 
+// Execute is a wrapper around aerospike.Client.Execute that uses the connection semaphore
+// to limit concurrent connections. Execute runs a server-side UDF on a single key.
+func (c *Client) Execute(policy *aerospike.WritePolicy, key *aerospike.Key, packageName string, functionName string, args ...aerospike.Value) (any, aerospike.Error) {
+	if err := c.acquirePermit(policy); err != nil {
+		return nil, err
+	}
+	defer c.releasePermit()
+
+	start := gocore.CurrentTime()
+	defer func() {
+		c.stats.stat.NewStat("Execute").AddTime(start)
+	}()
+
+	return c.Client.Execute(policy, key, packageName, functionName, args...)
+}
+
+// EnableQuerySemaphore activates the query semaphore with the given max concurrent queries.
+// This should be called by services that perform long-running scans (pruner, block-assembly
+// unmined iterator, consistency scanner) to prevent streaming queries from monopolising the
+// connection pool and starving short-lived point operations.
+//
+// If maxConcurrentQueries is 0, a default of 25% of ConnectionQueueSize is used.
+// This method must be called before any queries are issued. It is not safe for concurrent use.
+func (c *Client) EnableQuerySemaphore(maxConcurrentQueries int) {
+	if maxConcurrentQueries <= 0 {
+		maxConcurrentQueries = int(float64(cap(c.connSemaphore)) * DefaultQuerySemaphoreFraction)
+		if maxConcurrentQueries < 1 {
+			maxConcurrentQueries = 1
+		}
+	}
+	c.querySemaphore = make(chan struct{}, maxConcurrentQueries)
+}
+
+// QueryPartitions is a wrapper around aerospike.Client.QueryPartitions.
+// When the query semaphore is enabled (via EnableQuerySemaphore), it limits the number of
+// concurrent long-running streaming operations. The semaphore slot is held for the entire
+// streaming duration and released when the recordset finishes.
+// When the query semaphore is not enabled, calls pass through to the native client directly.
+func (c *Client) QueryPartitions(policy *aerospike.QueryPolicy, statement *aerospike.Statement, partitionFilter *aerospike.PartitionFilter) (*aerospike.Recordset, aerospike.Error) {
+	if c.querySemaphore == nil {
+		// No query semaphore configured -- pass through to native client
+		return c.Client.QueryPartitions(policy, statement, partitionFilter)
+	}
+
+	if err := c.acquireQueryPermit(policy); err != nil {
+		return nil, err
+	}
+
+	rs, err := c.Client.QueryPartitions(policy, statement, partitionFilter)
+	if err != nil {
+		c.releaseQueryPermit()
+		return nil, err
+	}
+
+	// Wrap the recordset so the semaphore is released when it completes.
+	// We drain Results() in a goroutine; the channel is closed by the native client
+	// when the query finishes or the recordset is closed by the caller.
+	go func() {
+		for range rs.Results() { //nolint:revive // intentionally draining to detect completion
+		}
+		c.releaseQueryPermit()
+	}()
+
+	return rs, nil
+}
+
+// Query is a wrapper around aerospike.Client.Query.
+// When the query semaphore is enabled, it limits concurrent streaming operations.
+// Otherwise, calls pass through to the native client directly.
+func (c *Client) Query(policy *aerospike.QueryPolicy, statement *aerospike.Statement) (*aerospike.Recordset, aerospike.Error) {
+	return c.QueryPartitions(policy, statement, nil)
+}
+
 // GetConnectionQueueSize returns the size of the connection semaphore.
-// This represents the maximum number of concurrent Aerospike operations allowed.
+// This represents the maximum number of concurrent short-lived Aerospike operations allowed.
 func (c *Client) GetConnectionQueueSize() int {
 	return cap(c.connSemaphore)
 }
 
-// acquirePermit attempts to acquire a permit from the connection semaphore with an optional timeout.
-// The policy parameter can be nil, in which case no timeout is used (blocks until available).
-// If the policy has a TotalTimeout > 0, a fraction of that timeout (semaphoreTimeoutFraction)
-// is used for permit acquisition to ensure the total operation time stays within bounds.
-// Returns an error if the timeout expires before a permit becomes available.
-//
-// Accepts any Aerospike policy type (BasePolicy, WritePolicy, BatchPolicy) as they all
-// embed BasePolicy which contains TotalTimeout.
-func (c *Client) acquirePermit(policy any) aerospike.Error {
-	totalTimeout := time.Duration(0)
+// GetQuerySemaphoreSize returns the size of the query semaphore, or 0 if not enabled.
+func (c *Client) GetQuerySemaphoreSize() int {
+	if c.querySemaphore == nil {
+		return 0
+	}
+	return cap(c.querySemaphore)
+}
 
-	// Extract timeout from policy if available
-	if policy != nil {
-		switch p := policy.(type) {
-		case *aerospike.BasePolicy:
-			if p != nil && p.TotalTimeout > 0 {
-				totalTimeout = p.TotalTimeout
-			}
-		case *aerospike.WritePolicy:
-			if p != nil && p.TotalTimeout > 0 {
-				totalTimeout = p.TotalTimeout
-			}
-		case *aerospike.BatchPolicy:
-			if p != nil && p.TotalTimeout > 0 {
-				totalTimeout = p.TotalTimeout
-			}
+// extractTimeout extracts the TotalTimeout from any Aerospike policy type.
+// Returns 0 if the policy is nil or does not have a TotalTimeout set.
+func extractTimeout(policy any) time.Duration {
+	if policy == nil {
+		return 0
+	}
+	switch p := policy.(type) {
+	case *aerospike.BasePolicy:
+		if p != nil && p.TotalTimeout > 0 {
+			return p.TotalTimeout
+		}
+	case *aerospike.WritePolicy:
+		if p != nil && p.TotalTimeout > 0 {
+			return p.TotalTimeout
+		}
+	case *aerospike.BatchPolicy:
+		if p != nil && p.TotalTimeout > 0 {
+			return p.TotalTimeout
+		}
+	case *aerospike.QueryPolicy:
+		if p != nil && p.TotalTimeout > 0 {
+			return p.TotalTimeout
 		}
 	}
+	return 0
+}
 
+// acquireSemaphore attempts to acquire a permit from the given semaphore with an optional timeout.
+// If totalTimeout > 0, a fraction of that timeout (semaphoreTimeoutFraction) is used for
+// acquisition to ensure the total operation time stays within bounds.
+func acquireSemaphore(sem chan struct{}, totalTimeout time.Duration) aerospike.Error {
 	if totalTimeout <= 0 {
 		// No timeout - block until available
-		c.connSemaphore <- struct{}{}
+		sem <- struct{}{}
 		return nil
 	}
 
 	// Calculate semaphore timeout as a fraction of total timeout
-	// This ensures total operation time (semaphore wait + actual operation) stays within bounds
 	semaphoreTimeout := time.Duration(float64(totalTimeout) * semaphoreTimeoutFraction)
 	if semaphoreTimeout < minSemaphoreTimeout {
 		semaphoreTimeout = minSemaphoreTimeout
@@ -342,16 +441,40 @@ func (c *Client) acquirePermit(policy any) aerospike.Error {
 	defer timer.Stop()
 
 	select {
-	case c.connSemaphore <- struct{}{}:
+	case sem <- struct{}{}:
 		return nil
 	case <-timer.C:
 		return aerospike.ErrTimeout
 	}
 }
 
+// acquirePermit attempts to acquire a permit from the connection semaphore with an optional timeout.
+// The policy parameter can be nil, in which case no timeout is used (blocks until available).
+// If the policy has a TotalTimeout > 0, a fraction of that timeout (semaphoreTimeoutFraction)
+// is used for permit acquisition to ensure the total operation time stays within bounds.
+// Returns an error if the timeout expires before a permit becomes available.
+//
+// Accepts any Aerospike policy type (BasePolicy, WritePolicy, BatchPolicy, QueryPolicy) as they all
+// embed BasePolicy which contains TotalTimeout.
+func (c *Client) acquirePermit(policy any) aerospike.Error {
+	return acquireSemaphore(c.connSemaphore, extractTimeout(policy))
+}
+
 // releasePermit releases a permit back to the connection semaphore.
 func (c *Client) releasePermit() {
 	<-c.connSemaphore
+}
+
+// acquireQueryPermit attempts to acquire a permit from the query semaphore.
+// Callers must check that c.querySemaphore != nil before calling.
+func (c *Client) acquireQueryPermit(policy any) aerospike.Error {
+	return acquireSemaphore(c.querySemaphore, extractTimeout(policy))
+}
+
+// releaseQueryPermit releases a permit back to the query semaphore.
+// Callers must check that c.querySemaphore != nil before calling.
+func (c *Client) releaseQueryPermit() {
+	<-c.querySemaphore
 }
 
 // CalculateKeySource generates a key source based on the transaction hash, vout, and batch size.

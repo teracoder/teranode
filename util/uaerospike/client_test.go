@@ -537,6 +537,118 @@ func TestClient_AcquirePermitTimeout(t *testing.T) {
 	})
 }
 
+func TestEnableQuerySemaphore(t *testing.T) {
+	t.Run("default size is 25% of conn pool", func(t *testing.T) {
+		client := &Client{
+			connSemaphore: make(chan struct{}, 128),
+			stats:         NewClientStats(),
+		}
+		assert.Equal(t, 0, client.GetQuerySemaphoreSize())
+
+		client.EnableQuerySemaphore(0)                      // 0 means use default fraction
+		assert.Equal(t, 32, client.GetQuerySemaphoreSize()) // 25% of 128
+	})
+
+	t.Run("explicit size", func(t *testing.T) {
+		client := &Client{
+			connSemaphore: make(chan struct{}, 256),
+			stats:         NewClientStats(),
+		}
+		client.EnableQuerySemaphore(16)
+		assert.Equal(t, 16, client.GetQuerySemaphoreSize())
+	})
+
+	t.Run("conn semaphore unchanged", func(t *testing.T) {
+		client := &Client{
+			connSemaphore: make(chan struct{}, 256),
+			stats:         NewClientStats(),
+		}
+		client.EnableQuerySemaphore(8)
+		assert.Equal(t, 256, client.GetConnectionQueueSize()) // unchanged
+		assert.Equal(t, 8, client.GetQuerySemaphoreSize())
+	})
+
+	t.Run("small pool gets minimum 1", func(t *testing.T) {
+		client := &Client{
+			connSemaphore: make(chan struct{}, 2),
+			stats:         NewClientStats(),
+		}
+		client.EnableQuerySemaphore(0)
+		assert.Equal(t, 1, client.GetQuerySemaphoreSize())
+	})
+}
+
+func TestExtractTimeout(t *testing.T) {
+	t.Run("nil policy", func(t *testing.T) {
+		assert.Equal(t, time.Duration(0), extractTimeout(nil))
+	})
+
+	t.Run("BasePolicy with timeout", func(t *testing.T) {
+		p := &aerospike.BasePolicy{TotalTimeout: 5 * time.Second}
+		assert.Equal(t, 5*time.Second, extractTimeout(p))
+	})
+
+	t.Run("WritePolicy with timeout", func(t *testing.T) {
+		p := aerospike.NewWritePolicy(0, 0)
+		p.TotalTimeout = 3 * time.Second
+		assert.Equal(t, 3*time.Second, extractTimeout(p))
+	})
+
+	t.Run("BatchPolicy with timeout", func(t *testing.T) {
+		p := aerospike.NewBatchPolicy()
+		p.TotalTimeout = 2 * time.Second
+		assert.Equal(t, 2*time.Second, extractTimeout(p))
+	})
+
+	t.Run("QueryPolicy with timeout", func(t *testing.T) {
+		p := aerospike.NewQueryPolicy()
+		p.TotalTimeout = 10 * time.Second
+		assert.Equal(t, 10*time.Second, extractTimeout(p))
+	})
+
+	t.Run("unknown policy type", func(t *testing.T) {
+		assert.Equal(t, time.Duration(0), extractTimeout("not-a-policy"))
+	})
+}
+
+func TestClient_QuerySemaphoreTimeout(t *testing.T) {
+	t.Run("query semaphore timeout with QueryPolicy", func(t *testing.T) {
+		client := &Client{
+			connSemaphore: make(chan struct{}, 1),
+			stats:         NewClientStats(),
+		}
+		client.EnableQuerySemaphore(1)
+
+		// Fill the query semaphore
+		client.querySemaphore <- struct{}{}
+
+		policy := aerospike.NewQueryPolicy()
+		policy.TotalTimeout = 1000 * time.Millisecond
+
+		start := time.Now()
+		err := client.acquireQueryPermit(policy)
+		elapsed := time.Since(start)
+
+		assert.Error(t, err)
+		assert.True(t, elapsed >= minSemaphoreTimeout && elapsed < 200*time.Millisecond,
+			"Expected timeout around %v, got %v", minSemaphoreTimeout, elapsed)
+	})
+}
+
+func TestGetConnectionQueueSize_OnlyConnSemaphore(t *testing.T) {
+	client := &Client{
+		connSemaphore: make(chan struct{}, 128),
+		stats:         NewClientStats(),
+	}
+	assert.Equal(t, 128, client.GetConnectionQueueSize())
+	assert.Equal(t, 0, client.GetQuerySemaphoreSize())
+
+	// After enabling query semaphore, conn size is unchanged
+	client.EnableQuerySemaphore(16)
+	assert.Equal(t, 128, client.GetConnectionQueueSize())
+	assert.Equal(t, 16, client.GetQuerySemaphoreSize())
+}
+
 // Test mock functionality separately
 func TestMockAerospikeClient_CompleteCoverage(t *testing.T) {
 	t.Run("mock client functionality", func(t *testing.T) {

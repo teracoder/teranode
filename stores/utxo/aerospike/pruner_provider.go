@@ -44,6 +44,12 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 		return prunerServiceInstance, prunerServiceError
 	}
 
+	// Enable the query semaphore on the shared Aerospike client so that
+	// long-running partition scans (QueryPartitions) are rate-limited and
+	// cannot monopolise the connection pool, starving point operations.
+	// Uses the default of 25% of ConnectionQueueSize.
+	s.client.EnableQuerySemaphore(0)
+
 	// Create options for the pruner service
 	opts := aeropruner.Options{
 		Logger:        s.logger,
