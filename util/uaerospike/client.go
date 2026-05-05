@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
@@ -30,6 +31,13 @@ const (
 
 	// minSemaphoreTimeout is the minimum timeout for semaphore acquisition
 	minSemaphoreTimeout = 100 * time.Millisecond
+
+	// queryActivePollInterval is how often the query-completion goroutine polls
+	// Recordset.IsActive() to detect when a streaming query has finished and the
+	// permit can be released. The interval is short enough that the permit is
+	// released promptly, but long enough that polling overhead is negligible
+	// compared to scan duration (typically minutes).
+	queryActivePollInterval = 100 * time.Millisecond
 )
 
 // getConnectionQueueSize returns the connection queue size from the given policy
@@ -46,6 +54,8 @@ type ClientStats struct {
 	stat             *gocore.Stat
 	operateStat      *gocore.Stat
 	batchOperateStat *gocore.Stat
+	queryStat        *gocore.Stat
+	queryWaitStat    *gocore.Stat
 }
 
 // NewClientStats creates a new ClientStats instance
@@ -55,6 +65,8 @@ func NewClientStats() *ClientStats {
 		stat:             stat,
 		operateStat:      stat.NewStat("Operate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
 		batchOperateStat: stat.NewStat("BatchOperate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
+		queryStat:        stat.NewStat("Query"),
+		queryWaitStat:    stat.NewStat("QuerySemaphoreWait"),
 	}
 }
 
@@ -64,15 +76,20 @@ func NewClientStats() *ClientStats {
 // It is always initialized and sized to ConnectionQueueSize.
 //
 // querySemaphore gates long-running streaming operations (Query, QueryPartitions).
-// It is nil by default -- queries pass through to the native client unbounded (same as
+// It is unset by default -- queries pass through to the native client unbounded (same as
 // previous behavior). Call EnableQuerySemaphore to activate it for services that perform
-// heavy scans (e.g. pruner, consistency scanner). When nil, the native connection pool
+// heavy scans (e.g. pruner, consistency scanner). When unset, the native connection pool
 // (LimitConnectionsToQueueSize) is the only concurrency limit for queries.
+//
+// querySemaphore is stored as an atomic.Pointer because EnableQuerySemaphore can be called
+// after the Client is shared across goroutines (e.g. from GetPrunerService). Atomic
+// publication ensures concurrent readers in QueryPartitions see a fully constructed channel
+// rather than a torn or nil value.
 type Client struct {
 	*aerospike.Client
-	connSemaphore  chan struct{} // Semaphore for short-lived operations (always set)
-	querySemaphore chan struct{} // Semaphore for long-running query/scan operations (nil until enabled)
-	stats          *ClientStats  // Always initialized, never nil
+	connSemaphore  chan struct{}                 // Semaphore for short-lived operations (always set)
+	querySemaphore atomic.Pointer[chan struct{}] // Semaphore for long-running query/scan operations (unset until EnableQuerySemaphore is called)
+	stats          *ClientStats                  // Always initialized, never nil
 }
 
 // NewClient creates a new Aerospike client with the specified hostname and port.
@@ -329,7 +346,11 @@ func (c *Client) Execute(policy *aerospike.WritePolicy, key *aerospike.Key, pack
 // connection pool and starving short-lived point operations.
 //
 // If maxConcurrentQueries is 0, a default of 25% of ConnectionQueueSize is used.
-// This method must be called before any queries are issued. It is not safe for concurrent use.
+//
+// EnableQuerySemaphore is idempotent: subsequent calls are ignored. This is intentional --
+// once a semaphore is in use, replacing the channel would orphan in-flight permits and could
+// allow more than the configured number of concurrent queries. The first caller wins.
+// It is safe to call concurrently with QueryPartitions/Query.
 func (c *Client) EnableQuerySemaphore(maxConcurrentQueries int) {
 	if maxConcurrentQueries <= 0 {
 		maxConcurrentQueries = int(float64(cap(c.connSemaphore)) * DefaultQuerySemaphoreFraction)
@@ -337,7 +358,23 @@ func (c *Client) EnableQuerySemaphore(maxConcurrentQueries int) {
 			maxConcurrentQueries = 1
 		}
 	}
-	c.querySemaphore = make(chan struct{}, maxConcurrentQueries)
+	sem := make(chan struct{}, maxConcurrentQueries)
+	// CompareAndSwap: only the first caller installs the channel. Concurrent or
+	// subsequent calls observe a non-nil pointer and fail the CAS, leaving the
+	// existing semaphore untouched.
+	c.querySemaphore.CompareAndSwap(nil, &sem)
+}
+
+// loadQuerySemaphore returns the current query semaphore channel, or nil if not enabled.
+// Callers should snapshot the returned channel and use that snapshot for both acquire and
+// release to avoid any chance of releasing into a different channel after a hypothetical
+// reconfiguration.
+func (c *Client) loadQuerySemaphore() chan struct{} {
+	p := c.querySemaphore.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // QueryPartitions is a wrapper around aerospike.Client.QueryPartitions.
@@ -346,28 +383,34 @@ func (c *Client) EnableQuerySemaphore(maxConcurrentQueries int) {
 // streaming duration and released when the recordset finishes.
 // When the query semaphore is not enabled, calls pass through to the native client directly.
 func (c *Client) QueryPartitions(policy *aerospike.QueryPolicy, statement *aerospike.Statement, partitionFilter *aerospike.PartitionFilter) (*aerospike.Recordset, aerospike.Error) {
-	if c.querySemaphore == nil {
+	sem := c.loadQuerySemaphore()
+	if sem == nil {
 		// No query semaphore configured -- pass through to native client
 		return c.Client.QueryPartitions(policy, statement, partitionFilter)
 	}
 
-	if err := c.acquireQueryPermit(policy); err != nil {
+	waitStart := gocore.CurrentTime()
+	if err := acquireSemaphore(sem, extractTimeout(policy)); err != nil {
 		return nil, err
 	}
+	c.stats.queryWaitStat.AddTime(waitStart)
 
+	queryStart := gocore.CurrentTime()
 	rs, err := c.Client.QueryPartitions(policy, statement, partitionFilter)
 	if err != nil {
-		c.releaseQueryPermit()
+		<-sem
 		return nil, err
 	}
 
-	// Wrap the recordset so the semaphore is released when it completes.
-	// We drain Results() in a goroutine; the channel is closed by the native client
-	// when the query finishes or the recordset is closed by the caller.
+	// Release the permit when the recordset finishes streaming. We MUST NOT read
+	// from rs.Results() here -- it returns the same channel the caller iterates,
+	// and competing reads would silently steal records. Instead, poll IsActive(),
+	// which flips to false either when the native client's signalEnd fires (all
+	// goroutines done) or when the caller invokes Close().
 	go func() {
-		for range rs.Results() { //nolint:revive // intentionally draining to detect completion
-		}
-		c.releaseQueryPermit()
+		waitForRecordsetInactive(rs.IsActive, queryActivePollInterval)
+		<-sem
+		c.stats.queryStat.AddTime(queryStart)
 	}()
 
 	return rs, nil
@@ -380,6 +423,15 @@ func (c *Client) Query(policy *aerospike.QueryPolicy, statement *aerospike.State
 	return c.QueryPartitions(policy, statement, nil)
 }
 
+// waitForRecordsetInactive blocks until isActive returns false, polling at the given interval.
+// Used by the query-semaphore release goroutine to detect recordset completion without
+// competing with the caller for records on Recordset.Results().
+func waitForRecordsetInactive(isActive func() bool, pollInterval time.Duration) {
+	for isActive() {
+		time.Sleep(pollInterval)
+	}
+}
+
 // GetConnectionQueueSize returns the size of the connection semaphore.
 // This represents the maximum number of concurrent short-lived Aerospike operations allowed.
 func (c *Client) GetConnectionQueueSize() int {
@@ -388,10 +440,11 @@ func (c *Client) GetConnectionQueueSize() int {
 
 // GetQuerySemaphoreSize returns the size of the query semaphore, or 0 if not enabled.
 func (c *Client) GetQuerySemaphoreSize() int {
-	if c.querySemaphore == nil {
+	sem := c.loadQuerySemaphore()
+	if sem == nil {
 		return 0
 	}
-	return cap(c.querySemaphore)
+	return cap(sem)
 }
 
 // extractTimeout extracts the TotalTimeout from any Aerospike policy type.
@@ -463,18 +516,6 @@ func (c *Client) acquirePermit(policy any) aerospike.Error {
 // releasePermit releases a permit back to the connection semaphore.
 func (c *Client) releasePermit() {
 	<-c.connSemaphore
-}
-
-// acquireQueryPermit attempts to acquire a permit from the query semaphore.
-// Callers must check that c.querySemaphore != nil before calling.
-func (c *Client) acquireQueryPermit(policy any) aerospike.Error {
-	return acquireSemaphore(c.querySemaphore, extractTimeout(policy))
-}
-
-// releaseQueryPermit releases a permit back to the query semaphore.
-// Callers must check that c.querySemaphore != nil before calling.
-func (c *Client) releaseQueryPermit() {
-	<-c.querySemaphore
 }
 
 // CalculateKeySource generates a key source based on the transaction hash, vout, and batch size.

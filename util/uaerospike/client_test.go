@@ -1,6 +1,7 @@
 package uaerospike
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/aerospike/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClient_Put(t *testing.T) {
@@ -619,14 +621,16 @@ func TestClient_QuerySemaphoreTimeout(t *testing.T) {
 		}
 		client.EnableQuerySemaphore(1)
 
-		// Fill the query semaphore
-		client.querySemaphore <- struct{}{}
+		// Fill the query semaphore via the public snapshot helper
+		sem := client.loadQuerySemaphore()
+		require.NotNil(t, sem)
+		sem <- struct{}{}
 
 		policy := aerospike.NewQueryPolicy()
 		policy.TotalTimeout = 1000 * time.Millisecond
 
 		start := time.Now()
-		err := client.acquireQueryPermit(policy)
+		err := acquireSemaphore(sem, extractTimeout(policy))
 		elapsed := time.Since(start)
 
 		assert.Error(t, err)
@@ -647,6 +651,182 @@ func TestGetConnectionQueueSize_OnlyConnSemaphore(t *testing.T) {
 	client.EnableQuerySemaphore(16)
 	assert.Equal(t, 128, client.GetConnectionQueueSize())
 	assert.Equal(t, 16, client.GetQuerySemaphoreSize())
+}
+
+// TestEnableQuerySemaphore_Idempotent verifies that the first call wins and subsequent
+// calls do not replace the channel. Replacing a live semaphore would orphan in-flight
+// permits and could allow more than the configured number of concurrent queries.
+func TestEnableQuerySemaphore_Idempotent(t *testing.T) {
+	client := &Client{
+		connSemaphore: make(chan struct{}, 128),
+		stats:         NewClientStats(),
+	}
+
+	client.EnableQuerySemaphore(8)
+	first := client.loadQuerySemaphore()
+	require.NotNil(t, first)
+	assert.Equal(t, 8, cap(first))
+
+	// Second call with a different size must not change the channel
+	client.EnableQuerySemaphore(64)
+	second := client.loadQuerySemaphore()
+	assert.Equal(t, 8, cap(second), "size must not change after second enable")
+	assert.Equal(t, 8, client.GetQuerySemaphoreSize())
+
+	// And the underlying channel must be the same instance: a permit acquired
+	// against the first snapshot is observed by a subsequent loadQuerySemaphore.
+	first <- struct{}{}
+	assert.Len(t, second, 1, "first and second snapshots must reference the same channel")
+}
+
+// TestEnableQuerySemaphore_ConcurrentEnable verifies that concurrent calls to
+// EnableQuerySemaphore are safe -- exactly one channel is installed and
+// GetQuerySemaphoreSize observes a consistent value.
+func TestEnableQuerySemaphore_ConcurrentEnable(t *testing.T) {
+	client := &Client{
+		connSemaphore: make(chan struct{}, 128),
+		stats:         NewClientStats(),
+	}
+
+	const goroutines = 32
+	start := make(chan struct{})
+	done := make(chan struct{}, goroutines)
+	for i := 0; i < goroutines; i++ {
+		size := 4 + i // each caller asks for a different size
+		go func() {
+			<-start
+			client.EnableQuerySemaphore(size)
+			done <- struct{}{}
+		}()
+	}
+	close(start)
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+
+	// Whichever caller won, the channel is non-nil and the size is one of the
+	// requested values. Repeated loads must return the same channel instance.
+	first := client.loadQuerySemaphore()
+	require.NotNil(t, first)
+	require.GreaterOrEqual(t, cap(first), 4)
+	require.Less(t, cap(first), 4+goroutines)
+
+	for range 10 {
+		again := client.loadQuerySemaphore()
+		assert.Equal(t, cap(first), cap(again))
+		// Sending on first must be observable on a re-load (same channel instance).
+		first <- struct{}{}
+		assert.Len(t, again, 1)
+		<-first
+	}
+}
+
+// TestWaitForRecordsetInactive verifies the polling helper returns once
+// isActive flips to false. This is the mechanism the QueryPartitions release
+// goroutine uses INSTEAD of draining Recordset.Results() (which would steal
+// records from the caller).
+func TestWaitForRecordsetInactive(t *testing.T) {
+	t.Run("returns when active flips to false", func(t *testing.T) {
+		var active atomic.Bool
+		active.Store(true)
+
+		done := make(chan struct{})
+		go func() {
+			waitForRecordsetInactive(active.Load, 5*time.Millisecond)
+			close(done)
+		}()
+
+		// Confirm the helper is still polling.
+		select {
+		case <-done:
+			t.Fatal("waitForRecordsetInactive returned while still active")
+		case <-time.After(20 * time.Millisecond):
+		}
+
+		active.Store(false)
+
+		select {
+		case <-done:
+		case <-time.After(200 * time.Millisecond):
+			t.Fatal("waitForRecordsetInactive did not return after isActive became false")
+		}
+	})
+
+	t.Run("returns immediately if already inactive", func(t *testing.T) {
+		var active atomic.Bool
+		// active.Load defaults to false
+
+		done := make(chan struct{})
+		go func() {
+			waitForRecordsetInactive(active.Load, 1*time.Second)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(50 * time.Millisecond):
+			t.Fatal("waitForRecordsetInactive did not return promptly when already inactive")
+		}
+	})
+}
+
+// TestQuerySemaphore_ReleaseOnInactive verifies that the permit acquired by a
+// (simulated) QueryPartitions call is released once the recordset becomes
+// inactive -- without any goroutine reading from a Results() channel. This is
+// the exact contract that the wrapper relies on; the previous implementation
+// drained Results() and would silently steal records from the caller.
+func TestQuerySemaphore_ReleaseOnInactive(t *testing.T) {
+	client := &Client{
+		connSemaphore: make(chan struct{}, 8),
+		stats:         NewClientStats(),
+	}
+	client.EnableQuerySemaphore(1)
+
+	sem := client.loadQuerySemaphore()
+	require.NotNil(t, sem)
+
+	// Simulate the path through QueryPartitions: acquire the permit and start
+	// the same release goroutine the wrapper uses, polling a stand-in
+	// IsActive() function.
+	require.NoError(t, asErr(acquireSemaphore(sem, 0)))
+
+	var active atomic.Bool
+	active.Store(true)
+
+	go func() {
+		waitForRecordsetInactive(active.Load, 5*time.Millisecond)
+		<-sem
+	}()
+
+	// Permit is currently held -- a second acquire with timeout must fail.
+	policy := aerospike.NewQueryPolicy()
+	policy.TotalTimeout = 200 * time.Millisecond
+	require.Error(t, asErr(acquireSemaphore(sem, extractTimeout(policy))))
+
+	// Mark the recordset inactive: release goroutine should free the permit.
+	active.Store(false)
+
+	// Now the next acquire must succeed within a reasonable window.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		if err := acquireSemaphore(sem, 50*time.Millisecond); err == nil {
+			<-sem
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("permit was not released after recordset became inactive")
+		}
+	}
+}
+
+// asErr converts an aerospike.Error into a standard error so testify's NoError/Error
+// assertions work. Returning the typed nil directly would compare non-nil to a
+// non-nil interface containing a nil pointer.
+func asErr(e aerospike.Error) error {
+	if e == nil {
+		return nil
+	}
+	return e
 }
 
 // Test mock functionality separately
