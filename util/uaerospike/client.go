@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"sort"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
@@ -18,26 +18,12 @@ const (
 	// if not specified in the client policy
 	DefaultConnectionQueueSize = 128
 
-	// DefaultQuerySemaphoreFraction is the default fraction of ConnectionQueueSize to use
-	// for the query semaphore when EnableQuerySemaphore is called without an explicit size.
-	// Long-running operations (Query, QueryPartitions) hold connections for the entire
-	// streaming duration (potentially minutes), so they get a smaller dedicated budget
-	// to prevent starving short-lived operations.
-	DefaultQuerySemaphoreFraction = 0.25 // 25% of pool for long-running ops
-
 	// semaphoreTimeoutFraction is the fraction of TotalTimeout to use for semaphore acquisition
 	// This ensures the total operation time (semaphore wait + actual operation) stays within bounds
 	semaphoreTimeoutFraction = 0.1 // 10% of total timeout
 
 	// minSemaphoreTimeout is the minimum timeout for semaphore acquisition
 	minSemaphoreTimeout = 100 * time.Millisecond
-
-	// queryActivePollInterval is how often the query-completion goroutine polls
-	// Recordset.IsActive() to detect when a streaming query has finished and the
-	// permit can be released. The interval is short enough that the permit is
-	// released promptly, but long enough that polling overhead is negligible
-	// compared to scan duration (typically minutes).
-	queryActivePollInterval = 100 * time.Millisecond
 )
 
 // getConnectionQueueSize returns the connection queue size from the given policy
@@ -54,8 +40,6 @@ type ClientStats struct {
 	stat             *gocore.Stat
 	operateStat      *gocore.Stat
 	batchOperateStat *gocore.Stat
-	queryStat        *gocore.Stat
-	queryWaitStat    *gocore.Stat
 }
 
 // NewClientStats creates a new ClientStats instance
@@ -65,31 +49,37 @@ func NewClientStats() *ClientStats {
 		stat:             stat,
 		operateStat:      stat.NewStat("Operate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
 		batchOperateStat: stat.NewStat("BatchOperate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
-		queryStat:        stat.NewStat("Query"),
-		queryWaitStat:    stat.NewStat("QuerySemaphoreWait"),
 	}
 }
 
-// Client is a wrapper around aerospike.Client that provides semaphores to limit concurrent connections.
+// ConnectionBudgetReport summarises declared connection use across services so
+// operators can see when configured concurrency over-subscribes the pool.
 //
-// connSemaphore gates short-lived point operations (Get, Put, Delete, Operate, BatchOperate, Execute).
-// It is always initialized and sized to ConnectionQueueSize.
-//
-// querySemaphore gates long-running streaming operations (Query, QueryPartitions).
-// It is unset by default -- queries pass through to the native client unbounded (same as
-// previous behavior). Call EnableQuerySemaphore to activate it for services that perform
-// heavy scans (e.g. pruner, consistency scanner). When unset, the native connection pool
-// (LimitConnectionsToQueueSize) is the only concurrency limit for queries.
-//
-// querySemaphore is stored as an atomic.Pointer because EnableQuerySemaphore can be called
-// after the Client is shared across goroutines (e.g. from GetPrunerService). Atomic
-// publication ensures concurrent readers in QueryPartitions see a fully constructed channel
-// rather than a torn or nil value.
+// Recommended is computed as int(PoolSize * Threshold). Exceeded is true when
+// TotalBudget > Recommended. The breakdown is a snapshot of all currently
+// registered service budgets, safe to read or mutate by the caller.
+type ConnectionBudgetReport struct {
+	TotalBudget int
+	PoolSize    int
+	Threshold   float64
+	Recommended int
+	Exceeded    bool
+	Breakdown   map[string]int
+}
+
+// Client is a wrapper around aerospike.Client that limits concurrent connections
+// via a single connSemaphore sized to ConnectionQueueSize and exposes a
+// connection-budget registry so each long-running query consumer can declare
+// its max concurrent use. The registry is diagnostic only -- it does not
+// throttle; it lets operators see when configured concurrency would
+// over-subscribe the pool (see RegisterConnectionBudget).
 type Client struct {
 	*aerospike.Client
-	connSemaphore  chan struct{}                 // Semaphore for short-lived operations (always set)
-	querySemaphore atomic.Pointer[chan struct{}] // Semaphore for long-running query/scan operations (unset until EnableQuerySemaphore is called)
-	stats          *ClientStats                  // Always initialized, never nil
+	connSemaphore chan struct{}
+	stats         *ClientStats
+
+	budgetMu sync.Mutex
+	budgets  map[string]int
 }
 
 // NewClient creates a new Aerospike client with the specified hostname and port.
@@ -107,6 +97,7 @@ func NewClient(hostname string, port int) (*Client, error) {
 		Client:        client,
 		connSemaphore: make(chan struct{}, queueSize),
 		stats:         NewClientStats(),
+		budgets:       make(map[string]int),
 	}, nil
 }
 
@@ -166,6 +157,7 @@ func NewClientWithPolicyAndHost(policy *aerospike.ClientPolicy, hosts ...*aerosp
 		Client:        client,
 		connSemaphore: make(chan struct{}, queueSize),
 		stats:         NewClientStats(),
+		budgets:       make(map[string]int),
 	}, nil
 }
 
@@ -340,111 +332,65 @@ func (c *Client) Execute(policy *aerospike.WritePolicy, key *aerospike.Key, pack
 	return c.Client.Execute(policy, key, packageName, functionName, args...)
 }
 
-// EnableQuerySemaphore activates the query semaphore with the given max concurrent queries.
-// This should be called by services that perform long-running scans (pruner, block-assembly
-// unmined iterator, consistency scanner) to prevent streaming queries from monopolising the
-// connection pool and starving short-lived point operations.
+// RegisterConnectionBudget records a service's expected max concurrent connection
+// use and returns a report covering all currently registered services. The
+// registry is diagnostic only: callers use the returned report to emit an
+// operator-facing log when Exceeded is true. It does not throttle.
 //
-// If maxConcurrentQueries is 0, a default of 25% of ConnectionQueueSize is used.
+// Re-registering the same service replaces the prior value (use this when a
+// service's worker count is re-computed). Passing a budget of 0 removes the
+// service from the breakdown.
 //
-// EnableQuerySemaphore is idempotent: subsequent calls are ignored. This is intentional --
-// once a semaphore is in use, replacing the channel would orphan in-flight permits and could
-// allow more than the configured number of concurrent queries. The first caller wins.
-// It is safe to call concurrently with QueryPartitions/Query.
-func (c *Client) EnableQuerySemaphore(maxConcurrentQueries int) {
-	if maxConcurrentQueries <= 0 {
-		maxConcurrentQueries = int(float64(cap(c.connSemaphore)) * DefaultQuerySemaphoreFraction)
-		if maxConcurrentQueries < 1 {
-			maxConcurrentQueries = 1
-		}
+// Concurrent calls from different services are safe. The threshold parameter
+// is applied to the returned report only; it is not persisted.
+func (c *Client) RegisterConnectionBudget(service string, budget int, threshold float64) ConnectionBudgetReport {
+	c.budgetMu.Lock()
+	defer c.budgetMu.Unlock()
+
+	if c.budgets == nil {
+		c.budgets = make(map[string]int)
 	}
-	sem := make(chan struct{}, maxConcurrentQueries)
-	// CompareAndSwap: only the first caller installs the channel. Concurrent or
-	// subsequent calls observe a non-nil pointer and fail the CAS, leaving the
-	// existing semaphore untouched.
-	c.querySemaphore.CompareAndSwap(nil, &sem)
+	if budget <= 0 {
+		delete(c.budgets, service)
+	} else {
+		c.budgets[service] = budget
+	}
+
+	return c.connectionBudgetReportLocked(threshold)
 }
 
-// loadQuerySemaphore returns the current query semaphore channel, or nil if not enabled.
-// Callers should snapshot the returned channel and use that snapshot for both acquire and
-// release to avoid any chance of releasing into a different channel after a hypothetical
-// reconfiguration.
-func (c *Client) loadQuerySemaphore() chan struct{} {
-	p := c.querySemaphore.Load()
-	if p == nil {
-		return nil
-	}
-	return *p
+// ConnectionBudget returns the current cumulative report without changing any
+// registration. Use this for periodic diagnostics or in tests.
+func (c *Client) ConnectionBudget(threshold float64) ConnectionBudgetReport {
+	c.budgetMu.Lock()
+	defer c.budgetMu.Unlock()
+	return c.connectionBudgetReportLocked(threshold)
 }
 
-// QueryPartitions is a wrapper around aerospike.Client.QueryPartitions.
-// When the query semaphore is enabled (via EnableQuerySemaphore), it limits the number of
-// concurrent long-running streaming operations. The semaphore slot is held for the entire
-// streaming duration and released when the recordset finishes.
-// When the query semaphore is not enabled, calls pass through to the native client directly.
-func (c *Client) QueryPartitions(policy *aerospike.QueryPolicy, statement *aerospike.Statement, partitionFilter *aerospike.PartitionFilter) (*aerospike.Recordset, aerospike.Error) {
-	sem := c.loadQuerySemaphore()
-	if sem == nil {
-		// No query semaphore configured -- pass through to native client
-		return c.Client.QueryPartitions(policy, statement, partitionFilter)
+func (c *Client) connectionBudgetReportLocked(threshold float64) ConnectionBudgetReport {
+	poolSize := cap(c.connSemaphore)
+	total := 0
+	breakdown := make(map[string]int, len(c.budgets))
+	for k, v := range c.budgets {
+		total += v
+		breakdown[k] = v
 	}
 
-	waitStart := gocore.CurrentTime()
-	if err := acquireSemaphore(sem, extractTimeout(policy)); err != nil {
-		return nil, err
-	}
-	c.stats.queryWaitStat.AddTime(waitStart)
-
-	queryStart := gocore.CurrentTime()
-	rs, err := c.Client.QueryPartitions(policy, statement, partitionFilter)
-	if err != nil {
-		<-sem
-		return nil, err
-	}
-
-	// Release the permit when the recordset finishes streaming. We MUST NOT read
-	// from rs.Results() here -- it returns the same channel the caller iterates,
-	// and competing reads would silently steal records. Instead, poll IsActive(),
-	// which flips to false either when the native client's signalEnd fires (all
-	// goroutines done) or when the caller invokes Close().
-	go func() {
-		waitForRecordsetInactive(rs.IsActive, queryActivePollInterval)
-		<-sem
-		c.stats.queryStat.AddTime(queryStart)
-	}()
-
-	return rs, nil
-}
-
-// Query is a wrapper around aerospike.Client.Query.
-// When the query semaphore is enabled, it limits concurrent streaming operations.
-// Otherwise, calls pass through to the native client directly.
-func (c *Client) Query(policy *aerospike.QueryPolicy, statement *aerospike.Statement) (*aerospike.Recordset, aerospike.Error) {
-	return c.QueryPartitions(policy, statement, nil)
-}
-
-// waitForRecordsetInactive blocks until isActive returns false, polling at the given interval.
-// Used by the query-semaphore release goroutine to detect recordset completion without
-// competing with the caller for records on Recordset.Results().
-func waitForRecordsetInactive(isActive func() bool, pollInterval time.Duration) {
-	for isActive() {
-		time.Sleep(pollInterval)
+	recommended := int(float64(poolSize) * threshold)
+	return ConnectionBudgetReport{
+		TotalBudget: total,
+		PoolSize:    poolSize,
+		Threshold:   threshold,
+		Recommended: recommended,
+		Exceeded:    total > recommended,
+		Breakdown:   breakdown,
 	}
 }
 
 // GetConnectionQueueSize returns the size of the connection semaphore.
-// This represents the maximum number of concurrent short-lived Aerospike operations allowed.
+// This represents the maximum number of concurrent Aerospike operations allowed.
 func (c *Client) GetConnectionQueueSize() int {
 	return cap(c.connSemaphore)
-}
-
-// GetQuerySemaphoreSize returns the size of the query semaphore, or 0 if not enabled.
-func (c *Client) GetQuerySemaphoreSize() int {
-	sem := c.loadQuerySemaphore()
-	if sem == nil {
-		return 0
-	}
-	return cap(sem)
 }
 
 // extractTimeout extracts the TotalTimeout from any Aerospike policy type.

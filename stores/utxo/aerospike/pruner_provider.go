@@ -56,20 +56,12 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 		LuaPackage:    LuaPackage,
 	}
 
-	// Create a new pruner service. NewService validates Options.Client, so we wait
-	// to activate the query semaphore until we know the pruner is actually viable.
+	// Create a new pruner service.
 	prunerService, err := aeropruner.NewService(s.settings, opts)
 	if err != nil {
 		prunerServiceError = err
 		return nil, err
 	}
-
-	// Enable the query semaphore on the shared Aerospike client so that
-	// long-running partition scans (QueryPartitions) are rate-limited and
-	// cannot monopolise the connection pool, starving point operations.
-	// Uses the default of 25% of ConnectionQueueSize. Idempotent: safe to
-	// call again from other services that perform heavy scans.
-	s.client.EnableQuerySemaphore(0)
 
 	// Store the singleton instance
 	prunerServiceInstance = prunerService
