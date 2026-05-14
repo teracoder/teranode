@@ -3,16 +3,22 @@ package netsync
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/url"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
@@ -23,11 +29,14 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/testdata"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
+	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/ordishs/go-bitcoin"
-	"github.com/ordishs/go-utils/expiringmap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -41,7 +50,7 @@ var (
 )
 
 func TestSyncManager_HandleBlockDirect(t *testing.T) {
-	t.Skip("This test requires a running Bitcoin SV node with RPC enabled")
+	t.Skip("This test requires a running SV Node with RPC enabled")
 
 	initPrometheusMetrics()
 
@@ -86,6 +95,7 @@ func TestSyncManager_HandleBlockDirect(t *testing.T) {
 		subtreeStore:     subtreeStore,
 		blockValidation:  blockValidation,
 	}
+	defer sm.orphanTxs.Stop()
 
 	msgBlock := &wire.MsgBlock{}
 	err = msgBlock.Deserialize(bytes.NewReader(blockBytes))
@@ -372,7 +382,7 @@ func TestSyncManager_createUtxos(t *testing.T) {
 	block.SetHeight(100)
 
 	// Test createUtxos
-	utxos := sm.createUtxos(context.Background(), txMap, block)
+	utxos := sm.createUtxos(context.Background(), txMap, block, 0)
 	assert.NotNil(t, utxos)
 }
 
@@ -463,9 +473,10 @@ func TestSyncManager_prepareSubtrees(t *testing.T) {
 	}
 
 	// For single transaction blocks, prepareSubtrees returns empty
-	subtrees, err := sm.prepareSubtrees(context.Background(), block)
+	subtrees, blockID, err := sm.prepareSubtrees(context.Background(), block)
 	assert.NoError(t, err)
 	assert.NotNil(t, subtrees)
+	assert.Equal(t, uint32(0), blockID) // single-tx block exits early, IsFSMCurrentState=false → blockID stays 0
 
 	blockchainClient.AssertExpectations(t)
 }
@@ -501,4 +512,388 @@ func TestSyncManager_ExtendTransaction(t *testing.T) {
 	// Test ExtendTransaction
 	err := sm.ExtendTransaction(context.Background(), tx, txMap)
 	assert.NoError(t, err)
+}
+
+// countingValidator tracks how many times Validate is called and optionally fails
+// the first N calls. It checks context cancellation to detect cascade behavior.
+type countingValidator struct {
+	validator.MockValidator
+	callCount      atomic.Int64
+	failFirst      int
+	failErr        error
+	mu             sync.Mutex
+	ctxCancelCount atomic.Int64 // tracks how many calls saw a cancelled context
+}
+
+func (v *countingValidator) Validate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...validator.Option) (*meta.Data, error) {
+	if ctx.Err() != nil {
+		v.ctxCancelCount.Add(1)
+		return nil, ctx.Err()
+	}
+
+	callNum := int(v.callCount.Add(1))
+
+	v.mu.Lock()
+	shouldFail := callNum <= v.failFirst
+	v.mu.Unlock()
+
+	if shouldFail {
+		return nil, v.failErr
+	}
+
+	return &meta.Data{}, nil
+}
+
+func (v *countingValidator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight uint32, validationOptions *validator.Options) (*meta.Data, error) {
+	return v.Validate(ctx, tx, blockHeight)
+}
+
+func (v *countingValidator) TriggerBatcher() {}
+
+func makeTxMap(t *testing.T, count int) *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper] {
+	t.Helper()
+	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](count)
+
+	for i := 0; i < count; i++ {
+		tx := bt.NewTx()
+		tx.Version = 1
+		_ = tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", uint64(1000+i))
+		txHash := chainhash.HashH([]byte(fmt.Sprintf("test-tx-%d", i)))
+		txMap.Set(txHash, &TxMapWrapper{Tx: tx})
+	}
+
+	return txMap
+}
+
+func TestWaitForPreviousBlockMined(t *testing.T) {
+	t.Run("returns immediately when parent is mined", func(t *testing.T) {
+		blockchainClient := &blockchain.Mock{}
+		prevHash := chainhash.HashH([]byte("prev-block"))
+		blockchainClient.On("GetBlockIsMined", mock.Anything, &prevHash).Return(true, nil)
+
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockValidation.IsParentMinedRetryMaxRetry = 3
+		tSettings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 1
+		tSettings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
+
+		sm := &SyncManager{
+			settings:         tSettings,
+			logger:           ulogger.TestLogger{},
+			blockchainClient: blockchainClient,
+		}
+
+		err := sm.waitForPreviousBlockMined(context.Background(), &prevHash, 100)
+		require.NoError(t, err)
+		blockchainClient.AssertNumberOfCalls(t, "GetBlockIsMined", 1)
+	})
+
+	t.Run("retries when parent is not mined yet then succeeds", func(t *testing.T) {
+		blockchainClient := &blockchain.Mock{}
+		prevHash := chainhash.HashH([]byte("prev-block"))
+
+		// First two calls: not mined. Third call: mined.
+		blockchainClient.On("GetBlockIsMined", mock.Anything, &prevHash).Return(false, nil).Times(2)
+		blockchainClient.On("GetBlockIsMined", mock.Anything, &prevHash).Return(true, nil).Once()
+
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockValidation.IsParentMinedRetryMaxRetry = 5
+		tSettings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 1
+		tSettings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
+
+		sm := &SyncManager{
+			settings:         tSettings,
+			logger:           ulogger.TestLogger{},
+			blockchainClient: blockchainClient,
+		}
+
+		err := sm.waitForPreviousBlockMined(context.Background(), &prevHash, 100)
+		require.NoError(t, err)
+		blockchainClient.AssertNumberOfCalls(t, "GetBlockIsMined", 3)
+	})
+
+	t.Run("retries on ErrBlockNotFound then succeeds", func(t *testing.T) {
+		blockchainClient := &blockchain.Mock{}
+		prevHash := chainhash.HashH([]byte("prev-block"))
+
+		// First call: block not found. Second call: mined.
+		blockchainClient.On("GetBlockIsMined", mock.Anything, &prevHash).Return(false, errors.ErrBlockNotFound).Once()
+		blockchainClient.On("GetBlockIsMined", mock.Anything, &prevHash).Return(true, nil).Once()
+
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockValidation.IsParentMinedRetryMaxRetry = 5
+		tSettings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 1
+		tSettings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
+
+		sm := &SyncManager{
+			settings:         tSettings,
+			logger:           ulogger.TestLogger{},
+			blockchainClient: blockchainClient,
+		}
+
+		err := sm.waitForPreviousBlockMined(context.Background(), &prevHash, 100)
+		require.NoError(t, err)
+		blockchainClient.AssertNumberOfCalls(t, "GetBlockIsMined", 2)
+	})
+
+	t.Run("fails after max retries exhausted", func(t *testing.T) {
+		blockchainClient := &blockchain.Mock{}
+		prevHash := chainhash.HashH([]byte("prev-block"))
+		blockchainClient.On("GetBlockIsMined", mock.Anything, &prevHash).Return(false, nil)
+
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockValidation.IsParentMinedRetryMaxRetry = 2
+		tSettings.BlockValidation.IsParentMinedRetryBackoffMultiplier = 1
+		tSettings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
+
+		sm := &SyncManager{
+			settings:         tSettings,
+			logger:           ulogger.TestLogger{},
+			blockchainClient: blockchainClient,
+		}
+
+		err := sm.waitForPreviousBlockMined(context.Background(), &prevHash, 100)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "not mined yet")
+	})
+}
+
+func TestPreValidateTransactions_AllSucceed(t *testing.T) {
+	initPrometheusMetrics()
+
+	cv := &countingValidator{}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.SpendBatcherSize = 2
+	tSettings.Legacy.SpendBatcherConcurrency = 2
+
+	sm := &SyncManager{
+		settings:         tSettings,
+		logger:           ulogger.TestLogger{},
+		validationClient: cv,
+	}
+
+	txMap := makeTxMap(t, 10)
+
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), cv.callCount.Load(), "all 10 transactions should be validated")
+}
+
+func TestPreValidateTransactions_PartialFailure_RetriesSucceed(t *testing.T) {
+	initPrometheusMetrics()
+
+	// Fail the first 3 calls, succeed the rest. On retry, those 3 txs will be
+	// retried and succeed (callCount > failFirst), so the block should pass.
+	cv := &countingValidator{
+		failFirst: 3,
+		failErr:   errors.NewStorageError("DEVICE_OVERLOAD"),
+	}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.SpendBatcherSize = 1
+	tSettings.Legacy.SpendBatcherConcurrency = 1
+
+	sm := &SyncManager{
+		settings:         tSettings,
+		logger:           ulogger.TestLogger{},
+		validationClient: cv,
+	}
+
+	txMap := makeTxMap(t, 10)
+
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100)
+	require.NoError(t, err, "should succeed after retrying the 3 failed transactions")
+
+	// 10 in first pass + 3 retried = 13 total calls
+	assert.Equal(t, int64(13), cv.callCount.Load())
+	assert.Equal(t, int64(0), cv.ctxCancelCount.Load(), "no calls should have seen a cancelled context")
+}
+
+func TestPreValidateTransactions_AllFail_NoProgress_GivesUp(t *testing.T) {
+	initPrometheusMetrics()
+
+	cv := &countingValidator{
+		failFirst: 100000, // always fail
+		failErr:   errors.NewStorageError("DEVICE_OVERLOAD"),
+	}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.SpendBatcherSize = 2
+	tSettings.Legacy.SpendBatcherConcurrency = 2
+
+	sm := &SyncManager{
+		settings:         tSettings,
+		logger:           ulogger.TestLogger{},
+		validationClient: cv,
+	}
+
+	txMap := makeTxMap(t, 5)
+
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no progress")
+
+	// First pass (5) + one retry attempt (5) = 10, then gives up on no progress
+	assert.Equal(t, int64(10), cv.callCount.Load())
+}
+
+func TestPreValidateTransactions_NonRetryableError_FailsImmediately(t *testing.T) {
+	initPrometheusMetrics()
+
+	// A non-retryable error (e.g. double-spend) should not be retried
+	cv := &countingValidator{
+		failFirst: 1,
+		failErr:   errors.NewUtxoFrozenError("utxo is frozen"),
+	}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.SpendBatcherSize = 1
+	tSettings.Legacy.SpendBatcherConcurrency = 1
+
+	sm := &SyncManager{
+		settings:         tSettings,
+		logger:           ulogger.TestLogger{},
+		validationClient: cv,
+	}
+
+	txMap := makeTxMap(t, 5)
+
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-retryable")
+
+	// All 5 should run (no cascade), but no retry should happen
+	assert.Equal(t, int64(5), cv.callCount.Load())
+}
+
+func TestPreValidateTransactions_ParentContextCancelled(t *testing.T) {
+	initPrometheusMetrics()
+
+	slowValidator := &countingValidator{}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.SpendBatcherSize = 1
+	tSettings.Legacy.SpendBatcherConcurrency = 1
+
+	sm := &SyncManager{
+		settings:         tSettings,
+		logger:           ulogger.TestLogger{},
+		validationClient: slowValidator,
+	}
+
+	txMap := makeTxMap(t, 3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	err := sm.PreValidateTransactions(ctx, txMap, chainhash.Hash{}, 100)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "context cancelled")
+}
+
+// TestSyncManager_createUtxos_MergesBlockIDsForExistingTxs verifies that when a tx
+// already exists in the utxo store (e.g. created by an earlier crashed attempt or by
+// the propagation path) createUtxos merges the current block's ID into the existing
+// record's BlockIDs instead of silently dropping it. Without the merge, the next
+// block's validOrderAndBlessed check fails with "has no block IDs" in
+// model/Block.go getParentTxMetaBlockIDs.
+func TestSyncManager_createUtxos_MergesBlockIDsForExistingTxs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+
+	storeURL, err := url.Parse("sqlitememory:///test_create_utxos_merge")
+	require.NoError(t, err)
+
+	utxoStore, err := utxosql.New(ctx, logger, tSettings, storeURL)
+	require.NoError(t, err)
+
+	// Build a real, signable-shaped tx without inputs (parent placeholder).
+	tx := bt.NewTx()
+	tx.Version = 1
+	require.NoError(t, tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+	txHash := *tx.TxIDChainHash()
+
+	// Pre-create the tx in the store WITHOUT any MinedBlockInfo. This simulates
+	// the state after a slow-path subtreeValidation run (or propagation arrival
+	// before the block) that lands the tx with empty BlockIDs.
+	_, err = utxoStore.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	pre, err := utxoStore.Get(ctx, &txHash, fields.BlockIDs)
+	require.NoError(t, err)
+	require.Empty(t, pre.BlockIDs, "tx should start with empty BlockIDs to reproduce the bug")
+
+	// Wire up a SyncManager just enough for createUtxos. createUtxos only
+	// touches utxoStore, settings, logger and the txMap — no need for full DI.
+	sm := &SyncManager{
+		settings:  tSettings,
+		logger:    logger,
+		utxoStore: utxoStore,
+	}
+
+	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](1)
+	txMap.Set(txHash, &TxMapWrapper{Tx: tx})
+
+	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1}})
+	block.SetHeight(100)
+
+	const expectedBlockID uint32 = 42
+	require.NoError(t, sm.createUtxos(ctx, txMap, block, expectedBlockID))
+
+	post, err := utxoStore.Get(ctx, &txHash, fields.BlockIDs)
+	require.NoError(t, err)
+	require.Contains(t, post.BlockIDs, expectedBlockID,
+		"createUtxos must merge blockID %d into the pre-existing tx", expectedBlockID)
+}
+
+func TestSyncManager_quickValidationAllowed(t *testing.T) {
+	mainnetHighest := uint32(chaincfg.MainNetParams.Checkpoints[len(chaincfg.MainNetParams.Checkpoints)-1].Height)
+
+	tests := []struct {
+		name        string
+		chainParams *chaincfg.Params
+		height      uint32
+		want        bool
+	}{
+		{
+			name:        "nil chain params",
+			chainParams: nil,
+			height:      100,
+			want:        false,
+		},
+		{
+			name:        "regtest has no checkpoints",
+			chainParams: &chaincfg.RegressionNetParams,
+			height:      0,
+			want:        false,
+		},
+		{
+			name:        "mainnet height 0 is covered",
+			chainParams: &chaincfg.MainNetParams,
+			height:      0,
+			want:        true,
+		},
+		{
+			name:        "mainnet height equal to highest checkpoint is covered",
+			chainParams: &chaincfg.MainNetParams,
+			height:      mainnetHighest,
+			want:        true,
+		},
+		{
+			name:        "mainnet height one above highest checkpoint is not covered",
+			chainParams: &chaincfg.MainNetParams,
+			height:      mainnetHighest + 1,
+			want:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sm := &SyncManager{chainParams: tt.chainParams}
+			require.Equal(t, tt.want, sm.quickValidationAllowed(tt.height))
+		})
+	}
 }

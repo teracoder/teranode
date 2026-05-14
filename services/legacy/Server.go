@@ -1,7 +1,7 @@
-// Package legacy implements a Bitcoin SV legacy protocol server that handles peer-to-peer communication
+// Package legacy implements a BSV Blockchain legacy protocol server that handles peer-to-peer communication
 // and blockchain synchronization using the traditional Bitcoin network protocol.
 //
-// The legacy package provides a bridge between modern Bitcoin SV architecture and the traditional
+// The legacy package provides a bridge between modern BSV Blockchain architecture and the traditional
 // Bitcoin network protocol. It maintains compatibility with legacy Bitcoin nodes while integrating
 // with Teranode's high-performance microservices architecture.
 //
@@ -27,7 +27,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -228,47 +227,6 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 		checks = append(checks, health.Check{Name: "BlockAssembly", Check: s.blockAssemblyClient.Health})
 	}
 
-	// Add custom check for peer connection
-	checks = append(checks, health.Check{
-		Name: "PeerConnection",
-		Check: func(ctx context.Context, checkLiveness bool) (int, string, error) {
-			peersResp, err := s.GetPeers(ctx, &emptypb.Empty{})
-			if err != nil {
-				return http.StatusServiceUnavailable, "Failed to get peers for health check", err
-			}
-			peers := peersResp.GetPeers()
-			if len(peers) == 0 {
-				return http.StatusServiceUnavailable, "No connected peers", nil
-			}
-			return http.StatusOK, fmt.Sprintf("Connected to %d peers", len(peers)), nil
-		},
-	})
-
-	// Add custom check for recent peer activity
-	checks = append(checks, health.Check{
-		Name: "PeerActivity",
-		Check: func(ctx context.Context, checkLiveness bool) (int, string, error) {
-			peersResp, err := s.GetPeers(ctx, &emptypb.Empty{})
-			if err != nil {
-				return http.StatusServiceUnavailable, "Failed to get peers for activity check", err
-			}
-			peers := peersResp.GetPeers()
-			currentTime := time.Now().Unix()
-			recentActivityThreshold := currentTime - 120 // 2 minutes in seconds
-			hasRecentActivity := false
-			for _, p := range peers {
-				if p.GetLastRecv() >= recentActivityThreshold {
-					hasRecentActivity = true
-					break
-				}
-			}
-			if !hasRecentActivity {
-				return http.StatusServiceUnavailable, "No peer activity in the last 2 minutes", nil
-			}
-			return http.StatusOK, "Recent peer activity detected", nil
-		},
-	})
-
 	return health.CheckAll(ctx, checkLiveness, checks)
 }
 
@@ -415,10 +373,20 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*peer_api.GetP
 			BytesSent:     sp.BytesSent(),
 			BytesReceived: sp.BytesReceived(),
 			// AvgRecvBandwidth: sp.AvgRecvBandwidth(),
-			// AssocId:          sp.AssocId(),
-			// StreamPolicy:     sp.StreamPolicy(),
-			Inbound: sp.Inbound(),
+			AssocId:      sp.associationIDString(),
+			StreamPolicy: sp.streamPolicyString(),
+			Inbound:      sp.Inbound(),
 		})
+		if assoc := sp.Peer.AssociationRef(); assoc != nil {
+			p := resp.Peers[len(resp.Peers)-1]
+			for _, si := range assoc.Streams() {
+				p.Streams = append(p.Streams, &peer_api.StreamInfo{
+					StreamType: uint32(si.Type),
+					BytesSent:  si.BytesSent,
+					BytesRecv:  si.BytesRecv,
+				})
+			}
+		}
 	}
 
 	return resp, nil
@@ -574,15 +542,16 @@ func (s *Server) banPeer(peerAddr string, until int64) error {
 // Parameters:
 //   - ctx: Context that controls when logging should stop
 func (s *Server) logPeerStats(ctx context.Context) {
+	ctxLogger := s.logger.WithTraceContext(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Infof("[Legacy Server] Stopping peer statistics logging")
+			ctxLogger.Infof("[Legacy Server] Stopping peer statistics logging")
 			return
 		case <-time.After(time.Minute):
 			peersResp, err := s.GetPeers(ctx, &emptypb.Empty{})
 			if err != nil {
-				s.logger.Errorf("[Legacy Server] Failed to get peers for stats: %v", err)
+				ctxLogger.Errorf("[Legacy Server] Failed to get peers for stats: %v", err)
 				continue
 			}
 
@@ -591,15 +560,15 @@ func (s *Server) logPeerStats(ctx context.Context) {
 			for _, p := range peers {
 				lastSendElapsed := time.Since(time.Unix(p.GetLastSend(), 0))
 				lastRecvElapsed := time.Since(time.Unix(p.GetLastRecv(), 0))
-				s.logger.Infof("[Legacy Server] Peer %s (ID: %d) - Services: %s, Inbound: %t, Bytes Sent: %d, Bytes Received: %d, Ping: %dµs, Last Send: %v ago, Last Recv: %v ago, Height: %d, BanScore: %d",
+				ctxLogger.Infof("[Legacy Server] Peer %s (ID: %d) - Services: %s, Inbound: %t, Bytes Sent: %d, Bytes Received: %d, Ping: %dµs, Last Send: %v ago, Last Recv: %v ago, Height: %d, BanScore: %d",
 					p.GetAddr(), p.GetId(), p.GetServices(), p.GetInbound(), p.GetBytesSent(), p.GetBytesReceived(), p.GetPingTime(), lastSendElapsed, lastRecvElapsed, p.GetCurrentHeight(), p.GetBanscore())
 			}
 
 			state, err := s.blockchainClient.GetFSMCurrentState(context.Background())
 			if err != nil {
-				s.logger.Debugf("Peer stats - Connected: %d, Current FSM State: unknown, error: %v", len(peers), err)
+				ctxLogger.Debugf("Peer stats - Connected: %d, Current FSM State: unknown, error: %v", len(peers), err)
 			} else {
-				s.logger.Debugf("Peer stats - Connected: %d, Current FSM State: %v", len(peers), state)
+				ctxLogger.Debugf("Peer stats - Connected: %d, Current FSM State: %v", len(peers), state)
 			}
 		}
 	}
@@ -636,8 +605,11 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// Blocks until the FSM transitions from the IDLE state
 	err := s.blockchainClient.WaitUntilFSMTransitionFromIdleState(ctx)
 	if err != nil {
+		if errors.IsContextError(err) {
+			s.logger.Infof("[Legacy Server] Shutting down during FSM wait")
+			return err
+		}
 		s.logger.Errorf("[Legacy Server] Failed to wait for FSM transition from IDLE state: %s", err)
-
 		return err
 	}
 

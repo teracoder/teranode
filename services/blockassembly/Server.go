@@ -37,13 +37,12 @@ import (
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/bump"
 	"github.com/bsv-blockchain/teranode/util/health"
 	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/jellydator/ttlcache/v3"
-	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
-	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -406,7 +405,7 @@ func (ba *BlockAssembly) subtreeStorageWorker(ctx context.Context, workChan <-ch
 				result.storedOK = true
 				result.err = nil
 			} else {
-				ba.logger.Errorf(err.Error())
+				ba.logger.Errorf("%s", err.Error())
 				result.storedOK = false
 			}
 		} else {
@@ -419,20 +418,6 @@ func (ba *BlockAssembly) subtreeStorageWorker(ctx context.Context, workChan <-ch
 		case resultChan <- result:
 		case <-ctx.Done():
 			return
-		}
-
-		// Smart cache invalidation: only invalidate if significant change
-		currentTxCount := uint32(ba.blockAssembler.TxCount())
-		currentSubtreeCount := ba.blockAssembler.SubtreeCount()
-		// Use atomic access instead of iterating GetChainedSubtrees() to avoid deadlock
-		// when the worker is blocked waiting for ErrChan response
-		currentSize := ba.blockAssembler.GetChainedSubtreesTotalSize()
-
-		if ba.blockAssembler.shouldInvalidateCache(currentTxCount, currentSize, currentSubtreeCount) {
-			ba.logger.Debugf("[Server] Invalidating cache: significant change detected (txs=%d, size=%d, subtrees=%d)", currentTxCount, currentSize, currentSubtreeCount)
-			ba.blockAssembler.invalidateMiningCandidateCache()
-		} else {
-			ba.logger.Debugf("[Server] Keeping cache valid: minor change (txs=%d, size=%d, subtrees=%d)", currentTxCount, currentSize, currentSubtreeCount)
 		}
 
 		// Wait for all work to complete before sending response to caller
@@ -547,7 +532,10 @@ func (ba *BlockAssembly) storeSubtreeMetaWithRetry(ctx context.Context, subtreeR
 
 	if err != nil {
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree meta already exists", subtreeRetry.subtreeHash.String())
+			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree meta already exists, updating DeleteAtHeight", subtreeRetry.subtreeHash.String())
+			if dahErr := ba.subtreeStore.SetDAH(ctx, subtreeRetry.subtreeHash[:], fileformat.FileTypeSubtreeMeta, dah); dahErr != nil {
+				ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: could not update subtree meta DAH (meta may not exist): %s", subtreeRetry.subtreeHash.String(), dahErr)
+			}
 		} else {
 			ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: failed to retry store subtree meta: %s", subtreeRetry.subtreeHash.String(), err)
 			ba.handleRetryLogic(ctx, subtreeRetry, subtreeRetryChan, "subtree meta")
@@ -568,7 +556,12 @@ func (ba *BlockAssembly) storeSubtreeDataWithRetry(ctx context.Context, subtreeR
 
 	if err != nil {
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree already exists", subtreeRetry.subtreeHash.String())
+			ba.logger.Debugf("[BlockAssembly:Init][%s] subtreeRetryChan: subtree already exists, updating DeleteAtHeight", subtreeRetry.subtreeHash.String())
+			if dahErr := ba.subtreeStore.SetDAH(ctx, subtreeRetry.subtreeHash[:], fileformat.FileTypeSubtree, dah); dahErr != nil {
+				ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: failed to update subtree DAH: %s", subtreeRetry.subtreeHash.String(), dahErr)
+				ba.handleRetryLogic(ctx, subtreeRetry, subtreeRetryChan, "subtree DAH update")
+				return dahErr
+			}
 		} else {
 			ba.logger.Errorf("[BlockAssembly:Init][%s] subtreeRetryChan: failed to retry store subtree: %s", subtreeRetry.subtreeHash.String(), err)
 			ba.handleRetryLogic(ctx, subtreeRetry, subtreeRetryChan, "subtree")
@@ -649,7 +642,14 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 
 	// Check whether this subtree already exists in the store
 	if ok, _ := ba.subtreeStore.Exists(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree); ok {
-		ba.logger.Debugf("[BlockAssembly:storeSubtreeData][%s] subtree already exists", subtree.RootHash().String())
+		ba.logger.Debugf("[BlockAssembly:storeSubtreeData][%s] subtree already exists, updating DeleteAtHeight", subtree.RootHash().String())
+		dah := ba.blockAssembler.utxoStore.GetBlockHeight() + ba.settings.GlobalBlockHeightRetention
+		if err := ba.subtreeStore.SetDAH(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree, dah); err != nil {
+			return nil, nil, errors.NewProcessingError("[BlockAssembly:storeSubtreeData][%s] failed to update subtree DAH", subtree.RootHash().String(), err)
+		}
+		if err := ba.subtreeStore.SetDAH(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta, dah); err != nil {
+			ba.logger.Debugf("[BlockAssembly:storeSubtreeData][%s] could not update subtree meta DAH (meta may not exist): %s", subtree.RootHash().String(), err)
+		}
 		return nil, nil, errors.ErrBlobAlreadyExists
 	}
 
@@ -675,8 +675,16 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 			for idx, node := range subtreeRequest.Subtree.Nodes {
 				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 					txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
+					if !found && subtreeRequest.DeletedTxs != nil {
+						// Fallback: check if transaction was deleted during async storage
+						var deletedTxInpoints subtreepkg.TxInpoints
+						deletedTxInpoints, found = subtreeRequest.DeletedTxs.Get(node.Hash)
+						if found {
+							txInpoints = &deletedTxInpoints
+						}
+					}
 					if !found {
-						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap or DeletedTxs", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
 						return
 					}
 
@@ -749,6 +757,10 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 		defer close(allDoneCh)
 		<-subtreeStorageDone
 		<-metaDoneCh
+		// Trigger cleanup of soft-deleted transactions
+		if subtreeRequest.OnStorageComplete != nil {
+			subtreeRequest.OnStorageComplete()
+		}
 	}()
 
 	return subtreeDoneCh, allDoneCh, nil
@@ -860,8 +872,8 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 		tracing.WithParentStat(ba.stats),
 		tracing.WithHistogram(prometheusBlockAssemblyAddTx),
 		tracing.WithCounter(prometheusBlockAssemblyAddTxCounter),
-		tracing.WithTag("txid", utils.ReverseAndHexEncodeSlice(req.Txid)),
-		tracing.WithLogMessage(ba.logger, "[AddTx][%s] add tx called", utils.ReverseAndHexEncodeSlice(req.Txid)),
+		tracing.WithTag("txid", util.ReverseAndHexEncodeSlice(req.Txid)),
+		tracing.WithLogMessage(ba.logger, "[AddTx][%s] add tx called", util.ReverseAndHexEncodeSlice(req.Txid)),
 	)
 
 	defer func() {
@@ -870,7 +882,7 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 
 	if len(req.Txid) != 32 {
 		return nil, errors.WrapGRPC(
-			errors.NewProcessingError("invalid txid length: %d for %s", len(req.Txid), utils.ReverseAndHexEncodeSlice(req.Txid)))
+			errors.NewProcessingError("invalid txid length: %d for %s", len(req.Txid), util.ReverseAndHexEncodeSlice(req.Txid)))
 	}
 
 	ba.logger.Debugf("[AddTx] added tx %s to block assembler", chainhash.Hash(req.Txid).String())
@@ -924,13 +936,13 @@ func (ba *BlockAssembly) RemoveTx(ctx context.Context, req *blockassembly_api.Re
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "RemoveTx",
 		tracing.WithParentStat(ba.stats),
 		tracing.WithHistogram(prometheusBlockAssemblyRemoveTx),
-		tracing.WithLogMessage(ba.logger, "[RemoveTx][%s] called", utils.ReverseAndHexEncodeSlice(req.Txid)),
+		tracing.WithLogMessage(ba.logger, "[RemoveTx][%s] called", util.ReverseAndHexEncodeSlice(req.Txid)),
 	)
 	defer deferFn()
 
 	if len(req.Txid) != 32 {
 		return nil, errors.WrapGRPC(
-			errors.NewProcessingError("invalid txid length: %d for %s", len(req.Txid), utils.ReverseAndHexEncodeSlice(req.Txid)))
+			errors.NewProcessingError("invalid txid length: %d for %s", len(req.Txid), util.ReverseAndHexEncodeSlice(req.Txid)))
 	}
 
 	hash := chainhash.Hash(req.Txid)
@@ -1195,7 +1207,7 @@ func (ba *BlockAssembly) GetMiningCandidate(ctx context.Context, req *blockassem
 	}
 
 	ba.logger.Infof("[GetMiningCandidate][%s] returning mining candidate with %d transactions, %d subtrees, total size %d bytes",
-		utils.ReverseAndHexEncodeSlice(miningCandidate.Id),
+		util.ReverseAndHexEncodeSlice(miningCandidate.Id),
 		miningCandidate.NumTxs+1, // +1 for coinbase
 		len(miningCandidate.SubtreeHashes),
 		miningCandidate.SizeWithoutCoinbase,
@@ -1259,7 +1271,7 @@ func (ba *BlockAssembly) SubmitMiningSolution(ctx context.Context, req *blockass
 }
 
 func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSubmissionRequest) (*blockassembly_api.OKResponse, error) {
-	jobID := utils.ReverseAndHexEncodeSlice(req.SubmitMiningSolutionRequest.Id)
+	jobID := util.ReverseAndHexEncodeSlice(req.SubmitMiningSolutionRequest.Id)
 
 	ctx, _, endSpan := tracing.Tracer("blockassembly").Start(ctx, "submitMiningSolution",
 		tracing.WithParentStat(ba.stats),
@@ -1288,7 +1300,7 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 
 	bestBlockHeader, _ := ba.blockAssembler.CurrentBlock()
 	if bestBlockHeader.HashPrevBlock.IsEqual(hashPrevBlock) {
-		return nil, errors.NewProcessingError("[BlockAssembly][%s] already mining on top of the same block that is submitted", jobID)
+		return nil, errors.NewProcessingError("[BlockAssembly][%s] candidate is stale: chain has already advanced past its parent", jobID)
 	}
 
 	var coinbaseTx *bt.Tx
@@ -1373,6 +1385,14 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to create merkle tree", jobID, err)
 	}
 
+	// Compute coinbase BUMP (merkle proof in BRC-74 format) while subtree data is in memory.
+	// This is a best-effort operation — failure does not block block submission.
+	_, currentHeight := ba.blockAssembler.CurrentBlock()
+	var coinbaseBUMP []byte
+	if len(subtreesInJob) > 0 {
+		coinbaseBUMP = ba.computeCoinbaseBUMP(jobID, subtreesInJob, subtreeHashes, currentHeight+1)
+	}
+
 	// sizeInBytes from the subtrees, 80 byte header and varint bytes for txcount
 	blockSize := sizeInBytes + 80 + util.VarintSize(transactionCount)
 	// add the size of the coinbase tx to the blocksize
@@ -1407,11 +1427,12 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		SizeInBytes:      blockSize,
 		Subtrees:         jobSubtreeHashes, // we need to store the hashes of the subtrees in the block, without the coinbase
 		SubtreeSlices:    job.Subtrees,
+		CoinbaseBUMP:     coinbaseBUMP,
 	}
 
 	// check fully valid, including whether difficulty in header is low enough
 	// TODO add more checks to the Valid function, like whether the parent/child relationships are OK
-	if ok, err := block.Valid(ctx, ba.logger, ba.subtreeStore, nil, nil, nil, nil, ba.settings); !ok {
+	if ok, err := block.Valid(ctx, ba.logger, ba.subtreeStore, nil, nil, nil, nil, ba.settings, nil); !ok {
 		ba.logger.Errorf("[BlockAssembly][%s][%s] invalid block: %v - %v", jobID, block.Hash().String(), block.Header, err)
 
 		// the subtreeprocessor created an invalid block, we must reset
@@ -1444,17 +1465,12 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		return nil, errors.NewProcessingError("[BlockAssembly][%s][%s] failed to add block", jobID, block.Hash().String(), err)
 	}
 
-	// remove the subtrees from the DAH in the background
-	go func() {
-		callerDAHCtx, _, endSpanDAH := tracing.DecoupleTracingSpan(ctx, "blockassembly", "decoupleDHARemoval")
-		defer endSpanDAH()
-
-		if err := ba.removeSubtreesDAH(callerDAHCtx, block); err != nil {
-			// we don't return an error here, we have already added the block to the chain
-			// if this fails, it will be retried in the block validation service
-			ba.logger.Errorf("[BlockAssembly][%s][%s] failed to remove subtrees DAH: %v", jobID, block.Header.Hash(), err)
-		}
-	}()
+	// Mark subtrees as set — block assembly built and validated these subtrees,
+	// so they are ready for setTxMined processing. Without this, locally mined
+	// blocks would never complete the mining lifecycle.
+	if err = ba.blockchainClient.SetBlockSubtreesSet(callerCtx, block.Hash()); err != nil {
+		ba.logger.Errorf("[BlockAssembly][%s][%s] failed to set block subtrees_set: %v", jobID, block.Header.Hash(), err)
+	}
 
 	// remove jobs, we have already mined a block
 	// if we don't do this, all the subtrees will never be removed from memory
@@ -1495,6 +1511,126 @@ func (ba *BlockAssembly) createMerkleTreeFromSubtrees(jobID string, subtreesInJo
 	return hashMerkleRoot, nil
 }
 
+// computeCoinbaseBUMP computes the coinbase transaction's merkle proof in BUMP format (BRC-74).
+// It builds the proof from the coinbase (at subtree index 0, tx index 0) to the block merkle root.
+// Returns nil if any step fails — callers should treat nil as "proof not available".
+func (ba *BlockAssembly) computeCoinbaseBUMP(jobID string, subtreesInJob []*subtreepkg.Subtree, subtreeHashes []chainhash.Hash, blockHeight uint32) []byte {
+	// Convert subtree hashes to pointer slice to match bump.ComputeCoinbaseBUMP signature
+	subtreeHashPtrs := make([]*chainhash.Hash, len(subtreeHashes))
+	for i := range subtreeHashes {
+		subtreeHashPtrs[i] = &subtreeHashes[i]
+	}
+
+	bumpBytes, err := bump.ComputeCoinbaseBUMP(subtreesInJob[0], subtreeHashPtrs, blockHeight)
+	if err != nil {
+		ba.logger.Warnf("[computeCoinbaseBUMP][%s] failed to compute coinbase BUMP: %v", jobID, err)
+		return nil
+	}
+
+	return bumpBytes
+}
+
+// GetCandidateBlock retrieves the block metadata for an existing mining candidate.
+// It looks up the job by candidate ID, creates a default coinbase transaction,
+// computes the merkle root, and builds the 80-byte block header.
+// This is used by the asset service to stream the block in standard Bitcoin wire format
+// for pre-validation against an SVNode.
+func (ba *BlockAssembly) GetCandidateBlock(ctx context.Context, req *blockassembly_api.GetCandidateBlockRequest) (*blockassembly_api.GetCandidateBlockResponse, error) {
+	candidateID := util.ReverseAndHexEncodeSlice(req.Id)
+
+	_, _, endSpan := tracing.Tracer("blockassembly").Start(ctx, "GetCandidateBlock",
+		tracing.WithParentStat(ba.stats),
+		tracing.WithLogMessage(ba.logger, "[GetCandidateBlock] called for candidate %s", candidateID),
+	)
+	defer endSpan()
+
+	storeID, err := chainhash.NewHash(req.Id)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("invalid candidate ID", err))
+	}
+
+	jobItem := ba.jobStore.Get(*storeID)
+	if jobItem == nil {
+		return nil, errors.WrapGRPC(errors.NewNotFoundError("[GetCandidateBlock][%s] candidate not found", candidateID))
+	}
+
+	job := jobItem.Value()
+
+	// Create default coinbase transaction from the mining candidate
+	coinbaseTx, err := job.MiningCandidate.CreateCoinbaseTxCandidate(ba.blockAssembler.settings)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewProcessingError("[GetCandidateBlock][%s] failed to create coinbase tx", candidateID, err))
+	}
+
+	coinbaseTxIDHash := coinbaseTx.TxIDChainHash()
+
+	// Duplicate subtrees and replace coinbase placeholder in the first subtree
+	subtreesInJob := make([]*subtreepkg.Subtree, len(job.Subtrees))
+	subtreeHashes := make([]chainhash.Hash, len(job.Subtrees))
+	transactionCount := uint64(0)
+
+	if len(job.Subtrees) > 0 {
+		for i, st := range job.Subtrees {
+			if i == 0 {
+				subtreesInJob[i] = st.Duplicate()
+				subtreesInJob[i].ReplaceRootNode(coinbaseTxIDHash, 0, uint64(coinbaseTx.Size()))
+			} else {
+				subtreesInJob[i] = st
+			}
+
+			rootHash := subtreesInJob[i].RootHash()
+			subtreeHashes[i] = chainhash.Hash(rootHash[:])
+
+			transactionCount += uint64(st.Length())
+		}
+	} else {
+		transactionCount = 1
+	}
+
+	// Compute merkle root from subtrees
+	hashMerkleRoot, err := ba.createMerkleTreeFromSubtrees(candidateID, subtreesInJob, subtreeHashes, coinbaseTxIDHash)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewProcessingError("[GetCandidateBlock][%s] failed to create merkle tree", candidateID, err))
+	}
+
+	hashPrevBlock, err := chainhash.NewHash(job.MiningCandidate.PreviousHash)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewProcessingError("[GetCandidateBlock][%s] failed to convert hashPrevBlock", candidateID, err))
+	}
+
+	bits, err := model.NewNBitFromSlice(job.MiningCandidate.NBits)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewProcessingError("[GetCandidateBlock][%s] failed to convert bits", candidateID, err))
+	}
+
+	// Build the 80-byte block header with nonce=0 (PoW is skipped in proposal mode)
+	header := &model.BlockHeader{
+		Version:        job.MiningCandidate.Version,
+		HashPrevBlock:  hashPrevBlock,
+		HashMerkleRoot: hashMerkleRoot,
+		Timestamp:      job.MiningCandidate.Time,
+		Bits:           *bits,
+		Nonce:          0,
+	}
+
+	// Collect original subtree hashes (before coinbase replacement) for the response
+	// The asset service uses these to stream transactions from the subtree store
+	subtreeHashBytes := make([][]byte, len(job.Subtrees))
+	for i, st := range job.Subtrees {
+		subtreeHashBytes[i] = st.RootHash()[:]
+	}
+
+	ba.logger.Infof("[GetCandidateBlock][%s] returning candidate block with %d txs, %d subtrees",
+		candidateID, transactionCount, len(job.Subtrees))
+
+	return &blockassembly_api.GetCandidateBlockResponse{
+		Header:           header.Bytes(),
+		CoinbaseTx:       coinbaseTx.Bytes(),
+		SubtreeHashes:    subtreeHashBytes,
+		TransactionCount: transactionCount,
+	}, nil
+}
+
 // SubtreeCount returns the current number of subtrees managed by the block assembler.
 // This method provides a real-time count of active subtrees that are available for
 // inclusion in mining candidates. The count reflects the current state of the block
@@ -1509,74 +1645,6 @@ func (ba *BlockAssembly) createMerkleTreeFromSubtrees(jobID string, subtreesInJo
 //   - int: The current number of active subtrees in the block assembler
 func (ba *BlockAssembly) SubtreeCount() int {
 	return ba.blockAssembler.SubtreeCount()
-}
-
-// removeSubtreesDAH removes subtrees from the Double-spend Attempt Handler (DAH) after block confirmation.
-// This method handles the cleanup of subtrees that have been successfully included in a confirmed block,
-// ensuring they are removed from the DAH to prevent potential double-spend detection false positives.
-// The DAH tracks subtrees to detect conflicting transactions, and once a block is confirmed, the
-// included subtrees should be cleaned up to maintain accurate double-spend detection.
-//
-// The function performs the following operations:
-// - Iterates through all subtrees included in the confirmed block
-// - Removes each subtree from the DAH's tracking system
-// - Uses decoupled tracing to allow background processing without blocking
-// - Handles errors gracefully while maintaining system stability
-//
-// This cleanup process is critical for maintaining the accuracy of double-spend detection
-// and ensuring the DAH doesn't accumulate stale subtree references over time.
-//
-// Parameters:
-//   - ctx: Context for the removal operation, allowing for cancellation and tracing
-//   - block: The confirmed block containing subtrees to be removed from DAH
-//
-// Returns:
-//   - error: Any error encountered during subtree removal from DAH
-func (ba *BlockAssembly) removeSubtreesDAH(ctx context.Context, block *model.Block) (err error) {
-	ctx, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "removeSubtreesDAH",
-		tracing.WithParentStat(ba.stats),
-		tracing.WithHistogram(prometheusBlockAssemblyUpdateSubtreesDAH),
-		tracing.WithLogMessage(ba.logger, "[removeSubtreesDAH][%s] remove subtree DAHs for %d subtrees", block.Hash().String(), len(block.Subtrees)),
-	)
-	defer deferFn()
-
-	// decouple the tracing context to not cancel the context when the subtree DAH is being saved in the background
-	callerCtx, _, endSpan := tracing.DecoupleTracingSpan(ctx, "blockassembly", "decoupleSubtreeDAH")
-	defer endSpan()
-
-	g, gCtx := errgroup.WithContext(callerCtx)
-	util.SafeSetLimit(g, ba.settings.BlockAssembly.SubtreeProcessorConcurrentReads)
-
-	errorFound := atomic.Bool{}
-
-	// update the subtree DAHs
-	for _, subtreeHash := range block.Subtrees {
-		subtreeHashBytes := subtreeHash.CloneBytes()
-		subtreeHash := subtreeHash
-
-		g.Go(func() error {
-			if err := ba.subtreeStore.SetDAH(gCtx, subtreeHashBytes, fileformat.FileTypeSubtree, 0); err != nil {
-				// we don't return an error here, we want to try to update all subtrees
-				// if this fails, it will be retried in the block validation service
-				ba.logger.Errorf("[removeSubtreesDAH][%s][%s] failed to update subtree DAH: %v", block.Hash().String(), subtreeHash.String(), err)
-				errorFound.Store(true)
-			}
-
-			return nil
-		})
-	}
-
-	// wait for all updates to finish
-	_ = g.Wait()
-
-	if !errorFound.Load() {
-		// update block subtrees_set to true
-		if err = ba.blockchainClient.SetBlockSubtreesSet(ctx, block.Hash()); err != nil {
-			return errors.WrapGRPC(errors.NewServiceError("[ValidateBlock][%s] failed to set block subtrees_set", block.Hash().String(), err))
-		}
-	}
-
-	return nil
 }
 
 func (ba *BlockAssembly) ResetBlockAssembly(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.EmptyMessage, error) {
@@ -1612,6 +1680,57 @@ func (ba *BlockAssembly) ResetBlockAssemblyFully(ctx context.Context, _ *blockas
 
 	ba.blockAssembler.Reset(true)
 
+	return &blockassembly_api.EmptyMessage{}, nil
+}
+
+// ResetBlockAssemblyValidateInputs performs a reset with UTXO input validation.
+// Uses index-based scan (not full scan) for performance — only iterates unmined txs.
+// For each unmined transaction, verifies that its inputs are still spent by this transaction.
+// If an input is spent by a different tx, marks the tx as conflicting and excludes it.
+// Use this to recover from corrupted UTXO state (e.g. after a double-spend incident).
+func (ba *BlockAssembly) ResetBlockAssemblyValidateInputs(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.EmptyMessage, error) {
+	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "ResetBlockAssemblyValidateInputs",
+		tracing.WithParentStat(ba.stats),
+		tracing.WithLogMessage(ba.logger, "[ResetBlockAssemblyValidateInputs] called"),
+	)
+	defer deferFn()
+
+	if ba.blockAssembler.unminedTransactionsLoading.Load() {
+		ba.logger.Warnf("[ResetBlockAssemblyValidateInputs] service not ready - unmined transactions are still being loaded")
+		return nil, errors.NewServiceError("service not ready - unmined transactions are still being loaded")
+	}
+
+	ba.blockAssembler.ResetWithInputValidation()
+
+	return &blockassembly_api.EmptyMessage{}, nil
+}
+
+// CheckBlockAssemblyValidateInputs checks unmined tx inputs for validity without modifying state.
+// Iterates all unmined transactions and verifies each input is still spent by that transaction.
+// Unlike ResetBlockAssemblyValidateInputs, this method makes no changes to the UTXO store.
+// Returns an error if any unmined transactions are found with invalid inputs.
+func (ba *BlockAssembly) CheckBlockAssemblyValidateInputs(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.EmptyMessage, error) {
+	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "CheckBlockAssemblyValidateInputs",
+		tracing.WithParentStat(ba.stats),
+		tracing.WithLogMessage(ba.logger, "[CheckBlockAssemblyValidateInputs] called"),
+	)
+	defer deferFn()
+
+	if ba.blockAssembler.unminedTransactionsLoading.Load() {
+		ba.logger.Warnf("[CheckBlockAssemblyValidateInputs] service not ready - unmined transactions are still being loaded")
+		return nil, errors.NewServiceError("service not ready - unmined transactions are still being loaded")
+	}
+
+	invalidCount, err := ba.blockAssembler.CheckInputValidation(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if invalidCount > 0 {
+		return nil, errors.NewProcessingError("found %d unmined transactions with invalid inputs", invalidCount)
+	}
+
+	ba.logger.Infof("[CheckBlockAssemblyValidateInputs] all unmined transactions have valid inputs")
 	return &blockassembly_api.EmptyMessage{}, nil
 }
 

@@ -1284,13 +1284,13 @@ func TestIncrementSpentRecords(t *testing.T) {
 	assert.Equal(t, 0, totalExtraRecs)
 
 	res, err := store.IncrementSpentRecords(tx.TxIDChainHash(), 1)
-	require.NoError(t, err) // IncrementSpentRecords doesn't return error directly
+	require.NoError(t, err)
 
-	// Parse the response to check for error
+	// Lua now clamps spentExtraRecs to [0, totalExtraRecs] instead of erroring.
+	// With totalExtraRecs=0, incrementing by 1 should clamp to 0 and return OK.
 	parsedRes, err := store.ParseLuaMapResponse(res)
 	require.NoError(t, err)
-	assert.Equal(t, teranode_aerospike.LuaStatusError, parsedRes.Status)
-	assert.Contains(t, parsedRes.Message, "spentExtraRecs cannot be greater than totalExtraRecs")
+	assert.Equal(t, teranode_aerospike.LuaStatusOK, parsedRes.Status)
 }
 
 func TestStoreDecorate(t *testing.T) {
@@ -1545,6 +1545,38 @@ func TestSmokeTests(t *testing.T) {
 		require.NoError(t, err)
 
 		tests.Conflicting(t, store)
+	})
+
+	t.Run("aerospike_mined_then_spend_all_prunes", func(t *testing.T) {
+		// Pruner service is a process-wide singleton. Reset at both ends so
+		// this subtest doesn't leak a started service into later aerospike
+		// tests that expect GetPrunerService() to initialize fresh state.
+		teranode_aerospike.ResetPrunerServiceForTests()
+		t.Cleanup(teranode_aerospike.ResetPrunerServiceForTests)
+		_ = store.Delete(ctx, tests.TXHash)
+		_ = store.Delete(ctx, tests.ParentTx.TxIDChainHash())
+
+		prunerSvc, err := store.GetPrunerService()
+		require.NoError(t, err)
+		require.NotNil(t, prunerSvc)
+		prunerSvc.Start(ctx)
+
+		// Aerospike builds its secondary index asynchronously after Start; wait
+		// for the pruner to accept work before handing off to the shared suite.
+		waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer waitCancel()
+		for {
+			_, pruneErr := prunerSvc.Prune(waitCtx, 1, "<readiness-probe>")
+			if pruneErr == nil {
+				break
+			}
+			if waitCtx.Err() != nil {
+				require.NoError(t, pruneErr, "aerospike pruner did not become ready")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		tests.MinedThenSpendAllPrunes(t, store, prunerSvc)
 	})
 }
 
@@ -2370,6 +2402,7 @@ func TestDeletedChildren(t *testing.T) {
 		Namespace:     store.GetNamespace(),
 		Set:           store.GetName(),
 		IndexWaiter:   &mockIndexWaiter{},
+		LuaPackage:    teranode_aerospike.LuaPackage,
 	}
 
 	cleanupService, err := pruner.NewService(tSettings, opts)

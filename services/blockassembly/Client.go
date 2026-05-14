@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bsv-blockchain/go-batcher"
+	"github.com/bsv-blockchain/go-batcher/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -15,6 +15,8 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/batchermetrics"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 )
 
 // batchItem represents an item in a transaction batch.
@@ -55,7 +57,7 @@ type Client struct {
 	batchCh chan []*batchItem
 
 	// batcher manages transaction batching
-	batcher batcher.Batcher[batchItem]
+	batcher *batcher.Batcher[batchItem]
 }
 
 // NewClient creates a new block assembly client.
@@ -87,6 +89,7 @@ func NewClient(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		&util.ConnectionOptions{
 			MaxRetries:   maxRetries,
 			RetryBackoff: retryBackoff,
+			CallerName:   "blockassembly",
 		}, tSettings,
 	)
 	if err != nil {
@@ -113,7 +116,20 @@ func NewClient(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	sendBatch := func(batch []*batchItem) {
 		client.sendBatchToBlockAssembly(ctx, batch)
 	}
-	client.batcher = *batcher.New(batchSize, duration, sendBatch, true)
+	b := batcher.NewWithPool(batchSize, duration, sendBatch, tSettings.BatcherBackground,
+		batcher.WithName("blockassembly_client"),
+		batcher.WithLogger(logger),
+		batcher.WithMetrics(batchermetrics.Provider()),
+		batcher.WithTracer(tracing.Tracer("blockassembly").OTelTracer()),
+	)
+	if tSettings.BatcherDrainMode {
+		b.SetDrainMode(true)
+	}
+	if tSettings.BlockAssembly.SendBatchMaxConcurrent > 0 {
+		b.SetMaxConcurrent(tSettings.BlockAssembly.SendBatchMaxConcurrent)
+		logger.Infof("Block assembly batch max concurrent: %d", tSettings.BlockAssembly.SendBatchMaxConcurrent)
+	}
+	client.batcher = b
 
 	return client, nil
 }
@@ -133,6 +149,7 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 	baConn, err := util.GetGRPCClient(ctx, blockAssemblyGrpcAddress, &util.ConnectionOptions{
 		MaxRetries:   tSettings.GRPCMaxRetries,
 		RetryBackoff: tSettings.GRPCRetryBackoff,
+		CallerName:   "blockassembly",
 	}, tSettings)
 	if err != nil {
 		return nil, errors.NewServiceError("failed to connect to block assembly", err)
@@ -158,7 +175,20 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 	sendBatch := func(batch []*batchItem) {
 		client.sendBatchToBlockAssembly(ctx, batch)
 	}
-	client.batcher = *batcher.New(batchSize, duration, sendBatch, true)
+	b := batcher.NewWithPool(batchSize, duration, sendBatch, tSettings.BatcherBackground,
+		batcher.WithName("blockassembly_client"),
+		batcher.WithLogger(logger),
+		batcher.WithMetrics(batchermetrics.Provider()),
+		batcher.WithTracer(tracing.Tracer("blockassembly").OTelTracer()),
+	)
+	if tSettings.BatcherDrainMode {
+		b.SetDrainMode(true)
+	}
+	if tSettings.BlockAssembly.SendBatchMaxConcurrent > 0 {
+		b.SetMaxConcurrent(tSettings.BlockAssembly.SendBatchMaxConcurrent)
+		logger.Infof("Block assembly batch max concurrent: %d", tSettings.BlockAssembly.SendBatchMaxConcurrent)
+	}
+	client.batcher = b
 
 	return client, nil
 }
@@ -232,7 +262,7 @@ func (s *Client) Store(ctx context.Context, hash *chainhash.Hash, fee, size uint
 	} else {
 		/* batch mode */
 		done := make(chan error)
-		s.batcher.Put(&batchItem{
+		s.batcher.PutCtx(ctx, &batchItem{
 			req:  req,
 			done: done,
 		})
@@ -353,6 +383,19 @@ func (s *Client) GenerateBlocks(ctx context.Context, req *blockassembly_api.Gene
 	}
 
 	return unwrappedErr
+}
+
+// GetCandidateBlock retrieves block metadata for an existing mining candidate.
+// Returns the 80-byte header, coinbase tx, subtree hashes, and tx count.
+func (s *Client) GetCandidateBlock(ctx context.Context, candidateID []byte) (*blockassembly_api.GetCandidateBlockResponse, error) {
+	res, err := s.client.GetCandidateBlock(ctx, &blockassembly_api.GetCandidateBlockRequest{
+		Id: candidateID,
+	})
+	if err != nil {
+		return nil, errors.UnwrapGRPC(err)
+	}
+
+	return res, nil
 }
 
 // sendBatchToBlockAssembly sends a batch of transactions to block assembly.
@@ -557,6 +600,26 @@ func (s *Client) ResetBlockAssemblyFully(ctx context.Context) error {
 	}
 
 	return unwrappedErr
+}
+
+// ResetBlockAssemblyValidateInputs performs a full reset with UTXO input validation.
+// For each unmined transaction, verifies inputs are still spent by this tx.
+// If an input is spent by a different tx, marks the tx as conflicting and excludes it.
+func (s *Client) ResetBlockAssemblyValidateInputs(ctx context.Context) error {
+	_, err := s.client.ResetBlockAssemblyValidateInputs(ctx, &blockassembly_api.EmptyMessage{})
+
+	unwrappedErr := errors.UnwrapGRPC(err)
+	if unwrappedErr == nil {
+		return nil
+	}
+
+	return unwrappedErr
+}
+
+// CheckBlockAssemblyValidateInputs checks unmined tx inputs for validity without modifying state.
+func (s *Client) CheckBlockAssemblyValidateInputs(ctx context.Context) error {
+	_, err := s.client.CheckBlockAssemblyValidateInputs(ctx, &blockassembly_api.EmptyMessage{})
+	return errors.UnwrapGRPC(err)
 }
 
 // GetBlockAssemblyState retrieves the current state of block assembly.

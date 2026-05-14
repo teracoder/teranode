@@ -369,13 +369,11 @@ func (u *Server) blessMissingTransaction(ctx context.Context, blockHash chainhas
 	// validate the transaction in the validation service
 	// this should spend utxos, create the tx meta and create new utxos
 	txMeta, err = u.validatorClient.ValidateWithOptions(ctx, tx, blockHeight, validationOptions)
+	if err != nil && !errors.Is(err, errors.ErrTxConflicting) {
+		return nil, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to validate transaction", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
+	}
 	if err != nil {
-		if errors.Is(err, errors.ErrTxConflicting) {
-			// conflicting transaction, which has been saved, but not spent
-			u.logger.Warnf("[blessMissingTransaction][%s/%s][%s] transaction is conflicting", blockHash.String(), subtreeHash.String(), tx.TxID())
-		} else {
-			return nil, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to validate transaction", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
-		}
+		u.logger.Warnf("[blessMissingTransaction][%s/%s][%s] transaction is conflicting", blockHash.String(), subtreeHash.String(), tx.TxID())
 	}
 
 	// Not recoverable, returning processing error
@@ -634,7 +632,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			logMsg = fmt.Sprintf("[ValidateSubtreeInternal][%s] [attempt #%d] (fail fast=%v) process %d txs from subtree", v.SubtreeHash.String(), attempt, failFast, len(txHashes))
 		}
 
-		u.logger.Debugf(logMsg)
+		u.logger.Debugf("%s", logMsg)
 
 		// unlike many other lists, this needs to be a pointer list, because a lot of values could be empty = nil
 
@@ -725,6 +723,8 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 	u.logger.Debugf("[ValidateSubtreeInternal][%s] adding %d nodes to subtree instance", v.SubtreeHash.String(), len(txHashes))
 
+	seen := make(map[chainhash.Hash]struct{}, len(txHashes))
+
 	for idx, txHash := range txHashes {
 		// if placeholder just add it and continue
 		if idx == 0 && txHash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
@@ -735,6 +735,12 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 			continue
 		}
+
+		if _, dup := seen[txHash]; dup {
+			return nil, errors.NewBlockInvalidError("[ValidateSubtreeInternal][%s] duplicate transaction in subtree at index %d: %s", v.SubtreeHash.String(), idx, txHash.String())
+		}
+
+		seen[txHash] = struct{}{}
 
 		if !txMetaSlice[idx].isSet {
 			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] tx meta not found in txMetaSlice at index %d: %s", v.SubtreeHash.String(), idx, txHash.String())
@@ -1050,6 +1056,12 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 		firstErrorOnce   sync.Once
 	)
 
+	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
+	// can read mtpStore[h] without locking and without making gRPC calls.
+	if err = u.validatorClient.EnsureMTPLoaded(ctx, blockHeight); err != nil {
+		return errors.NewProcessingError("[processMissingTransactions][%s] failed to pre-load MTP store: %v", subtreeHash.String(), err)
+	}
+
 	for level := uint32(0); level <= maxLevel; level++ {
 		g, gCtx := errgroup.WithContext(ctx)
 		util.SafeSetLimit(g, u.settings.SubtreeValidation.SpendBatcherSize*2)
@@ -1092,10 +1104,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 						// Report invalid subtree - contains truly invalid transaction
 						u.publishInvalidSubtree(gCtx, subtreeHash.String(), baseURL, "contains_invalid_transaction")
 
-						// return the error, so that the caller can handle it
-						if errors.Is(err, errors.ErrTxInvalid) {
-							return err
-						}
+						return err
 					} else {
 						// If the error is not a policy error, we log it as a processing error
 						u.logger.Errorf("[validateSubtree][%s] failed to bless missing transaction: %s: %v", subtreeHash.String(), tx.TxIDChainHash().String(), err)
@@ -1237,8 +1246,16 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 						// load the subtree data, making sure to validate it against the subtree txs
 						// this is less efficient than reading straight to disk with SetFromReader, but we need to validate the
 						// data before storing it on disk
-						// Use buffered reader to reduce syscalls - each tx.ReadFrom() makes many small reads
-						subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtreeForData, bufio.NewReaderSize(body, 1024*1024))
+						// Use pooled buffered reader to reduce syscalls and avoid per-call 1MB buffer allocation.
+						// defer the pool return so a panic / future early return still releases the reader,
+						// matching the pattern used at check_block_subtrees.go:201 and the second callsite below.
+						bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
+						bufferedReader.Reset(body)
+						defer func() {
+							bufferedReader.Reset(nil) // clear reference before returning to pool
+							bufioReaderPool.Put(bufferedReader)
+						}()
+						subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtreeForData, bufferedReader)
 						_ = body.Close()
 						if err != nil {
 							u.logger.Errorf("[validateSubtree][%s] failed to create subtree data from reader: %v", subtreeHash.String(), err)
@@ -1696,8 +1713,14 @@ func (u *Server) getMissingTransactionsFromFile(ctx context.Context, subtreeHash
 	}
 	defer subtreeDataReader.Close()
 
-	// Use buffered reader to reduce syscalls - each tx.ReadFrom() makes many small reads
-	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, bufio.NewReaderSize(subtreeDataReader, 1024*1024))
+	// Use pooled buffered reader to reduce syscalls and avoid per-call 1MB buffer allocation.
+	bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
+	bufferedReader.Reset(subtreeDataReader)
+	defer func() {
+		bufferedReader.Reset(nil) // clear reference before returning to pool
+		bufioReaderPool.Put(bufferedReader)
+	}()
+	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, bufferedReader)
 	if err != nil {
 		return nil, err
 	}

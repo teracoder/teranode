@@ -71,10 +71,16 @@ func (m *MockUtxostore) GetSpend(ctx context.Context, spend *Spend) (*SpendRespo
 
 // GetMeta mocks the retrieval of complete transaction metadata from the UTXO store.
 // Returns the configured mock response for full metadata lookup operations.
+//
+// Accepts either Return(*meta.Data) for the success path (data populated, no error),
+// Return(nil) for an empty metadata result, or Return(error) to surface a lookup failure.
 func (m *MockUtxostore) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
 	args := m.Called(ctx, hash, data)
 	if result := args.Get(0); result != nil {
-		*data = *result.(*meta.Data)
+		if md, ok := result.(*meta.Data); ok {
+			*data = *md
+			return nil
+		}
 	}
 	return args.Error(0)
 }
@@ -103,8 +109,23 @@ func (m *MockUtxostore) SetMinedMulti(ctx context.Context, hashes []*chainhash.H
 
 // GetUnminedTxIterator mocks the creation of an iterator for unmined transactions.
 // Returns the configured mock response for unmined transaction iteration.
-func (m *MockUtxostore) GetUnminedTxIterator(bool) (UnminedTxIterator, error) {
+func (m *MockUtxostore) GetUnminedTxIterator() (UnminedTxIterator, error) {
 	args := m.Called()
+	return args.Get(0).(UnminedTxIterator), args.Error(1)
+}
+
+// ScanInconsistentUnminedTxs mocks the consistency scan iterator.
+func (m *MockUtxostore) ScanInconsistentUnminedTxs() (ConsistencyScanIterator, error) {
+	args := m.Called()
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(ConsistencyScanIterator), args.Error(1)
+}
+
+// GetPrunableUnminedTxIterator mocks the creation of a pruner-specific lightweight iterator.
+func (m *MockUtxostore) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (UnminedTxIterator, error) {
+	args := m.Called(cutoffBlockHeight)
 	return args.Get(0).(UnminedTxIterator), args.Error(1)
 }
 
@@ -119,6 +140,12 @@ func (m *MockUtxostore) BatchDecorate(ctx context.Context, unresolvedMetaDataSli
 // Returns the configured mock response for previous output decoration operations.
 func (m *MockUtxostore) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 	args := m.Called(ctx, tx)
+	return args.Error(0)
+}
+
+// BatchPreviousOutputsDecorate mocks batch decoration of transaction inputs with previous output data.
+func (m *MockUtxostore) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
+	args := m.Called(ctx, txs)
 	return args.Error(0)
 }
 
@@ -253,6 +280,34 @@ func (m *MockUnminedTxIterator) Err() error {
 }
 
 func (m *MockUnminedTxIterator) Close() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+// MockConsistencyScanIterator is a mock implementation of utxo.ConsistencyScanIterator for testing
+type MockConsistencyScanIterator struct {
+	mock.Mock
+}
+
+func (m *MockConsistencyScanIterator) Next(ctx context.Context) ([]*InconsistentTxRecord, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*InconsistentTxRecord), args.Error(1)
+}
+
+func (m *MockConsistencyScanIterator) TotalScanned() int64 {
+	args := m.Called()
+	return args.Get(0).(int64)
+}
+
+func (m *MockConsistencyScanIterator) Err() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *MockConsistencyScanIterator) Close() error {
 	args := m.Called()
 	return args.Error(0)
 }

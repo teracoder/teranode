@@ -1,4 +1,4 @@
-// Package blockvalidation implements block validation for Bitcoin SV nodes in Teranode.
+// Package blockvalidation implements block validation for BSV Blockchain nodes in Teranode.
 //
 // This package provides the core functionality for validating Bitcoin blocks, managing block subtrees,
 // and processing transaction metadata. It is designed for high-performance operation at scale,
@@ -44,7 +44,6 @@ import (
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/jellydator/ttlcache/v3"
-	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -92,7 +91,7 @@ type processBlockCatchup struct {
 	peerID string
 }
 
-// Server implements a high-performance block validation service for Bitcoin SV.
+// Server implements a high-performance block validation service for BSV Blockchain.
 // It coordinates block validation, subtree management, and transaction metadata processing
 // across multiple subsystems while maintaining chain consistency. The server supports
 // both synchronous and asynchronous validation modes, with automatic catchup capabilities
@@ -525,19 +524,6 @@ func (u *Server) Init(ctx context.Context) (err error) {
 		u.blockValidation = NewBlockValidation(ctx, u.logger, u.settings, u.blockchainClient, u.subtreeStore, u.txStore, u.utxoStore, u.validatorClient, subtreeValidationClient)
 	}
 
-	// if our FSM state is CATCHINGBLOCKS, this is probably a remnant of a crash, put the node back in RUNNING state
-	isCatchingBlocks, err := u.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateCATCHINGBLOCKS)
-	if err != nil {
-		u.logger.Errorf("[Init] failed to check if FSM currently catching blocks: %v", err)
-	}
-
-	if isCatchingBlocks {
-		u.logger.Infof("[Init] FSM is in CATCHINGBLOCKS state, setting it to RUNNING")
-		if err = u.blockchainClient.Run(ctx, "blockvalidation"); err != nil {
-			return errors.NewServiceError("[Init] failed to set FSM state to RUNNING", err)
-		}
-	}
-
 	go u.processBlockNotify.Start()
 	go u.catchupAlternatives.Start()
 
@@ -622,6 +608,22 @@ func (u *Server) Init(ctx context.Context) (err error) {
 							continue
 						}
 
+						// FSM rejected the transition (e.g. LEGACYSYNCING active) — not a peer issue
+						if errors.Is(err, errors.ErrStateError) {
+							u.logger.Warnf("[catchup] FSM rejected catchup for block %s (node not in RUNNING state), clearing markers", c.block.Hash().String())
+							u.processBlockNotify.Delete(*c.block.Hash())
+							u.catchupAlternatives.Delete(*c.block.Hash())
+							continue
+						}
+
+						// Local infrastructure/service failure (e.g. blockchain service unavailable) — not a peer issue
+						if errors.Is(err, errors.ErrServiceError) {
+							u.logger.Warnf("[catchup] Local service error during catchup for block %s, clearing markers to allow retry: %v", c.block.Hash().String(), err)
+							u.processBlockNotify.Delete(*c.block.Hash())
+							u.catchupAlternatives.Delete(*c.block.Hash())
+							continue
+						}
+
 						// Report catchup failure to P2P service
 						u.reportCatchupFailure(ctx, c.peerID)
 
@@ -634,6 +636,8 @@ func (u *Server) Init(ctx context.Context) (err error) {
 
 						// If block is invalid, don't try other peers; continue to next catchup request
 						// Block is expected to be added to the block store as invalid somewhere else
+						// Note: ErrBlockIncomplete intentionally falls through to retry with alternative peers,
+						// since incomplete blocks (e.g. from seeded peers) may be available from other peers
 						if errors.Is(err, errors.ErrBlockInvalid) ||
 							errors.Is(err, errors.ErrTxMissingParent) ||
 							errors.Is(err, errors.ErrTxNotFound) ||
@@ -1013,6 +1017,10 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		// Blocks until the FSM transitions from the IDLE state
 		err := u.blockchainClient.WaitUntilFSMTransitionFromIdleState(gctx)
 		if err != nil {
+			if errors.IsContextError(err) {
+				u.logger.Infof("[Block Validation Service] Shutting down during FSM wait")
+				return err
+			}
 			u.logger.Errorf("[Block Validation Service] Failed to wait for FSM transition from IDLE state: %s", err)
 			return err
 		}
@@ -1066,6 +1074,7 @@ func (u *Server) Stop(_ context.Context) error {
 	// Wait for all background tasks in BlockValidation to complete
 	if u.blockValidation != nil {
 		u.blockValidation.Wait()
+		u.blockValidation.StopCaches()
 	}
 
 	// close the kafka consumer gracefully
@@ -1094,14 +1103,14 @@ func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockF
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "BlockFound",
 		tracing.WithParentStat(u.stats),
 		tracing.WithHistogram(prometheusBlockValidationBlockFound),
-		tracing.WithDebugLogMessage(u.logger, "[BlockFound][%s] called from %s", utils.ReverseAndHexEncodeSlice(req.Hash), req.GetBaseUrl()),
+		tracing.WithDebugLogMessage(u.logger, "[BlockFound][%s] called from %s", util.ReverseAndHexEncodeSlice(req.Hash), req.GetBaseUrl()),
 	)
 	defer deferFn()
 
 	hash, err := chainhash.NewHash(req.Hash)
 	if err != nil {
 		return nil, errors.WrapGRPC(
-			errors.NewProcessingError("[BlockFound][%s] failed to create hash from bytes", utils.ReverseAndHexEncodeSlice(req.Hash), err))
+			errors.NewProcessingError("[BlockFound][%s] failed to create hash from bytes", util.ReverseAndHexEncodeSlice(req.Hash), err))
 	}
 
 	// first check if the block exists, it is very expensive to do all the checks below
@@ -1112,7 +1121,7 @@ func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockF
 	}
 
 	if exists {
-		u.logger.Infof("[BlockFound][%s] already validated, skipping", utils.ReverseAndHexEncodeSlice(req.Hash))
+		u.logger.Infof("[BlockFound][%s] already validated, skipping", util.ReverseAndHexEncodeSlice(req.Hash))
 		return &blockvalidation_api.EmptyMessage{}, nil
 	}
 
@@ -1147,13 +1156,13 @@ func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockF
 func (u *Server) RevalidateBlock(ctx context.Context, request *blockvalidation_api.RevalidateBlockRequest) (*blockvalidation_api.EmptyMessage, error) {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "RevalidateBlock",
 		tracing.WithParentStat(u.stats),
-		tracing.WithLogMessage(u.logger, "[RevalidateBlock][%s] revalidate block called", utils.ReverseAndHexEncodeSlice(request.Hash)),
+		tracing.WithLogMessage(u.logger, "[RevalidateBlock][%s] revalidate block called", util.ReverseAndHexEncodeSlice(request.Hash)),
 	)
 	defer deferFn()
 
 	blockHash, err := chainhash.NewHash(request.Hash)
 	if err != nil {
-		return nil, errors.WrapGRPC(errors.NewProcessingError("[RevalidateBlock][%s] failed to create hash from bytes", utils.ReverseAndHexEncodeSlice(request.Hash), err))
+		return nil, errors.WrapGRPC(errors.NewProcessingError("[RevalidateBlock][%s] failed to create hash from bytes", util.ReverseAndHexEncodeSlice(request.Hash), err))
 	}
 
 	block, err := u.blockchainClient.GetBlock(ctx, blockHash)
@@ -1166,13 +1175,28 @@ func (u *Server) RevalidateBlock(ctx context.Context, request *blockvalidation_a
 		return nil, errors.WrapGRPC(errors.NewServiceError("[RevalidateBlock][%s] failed to get block header", blockHash.String(), err))
 	}
 
+	// Ensure all subtree files exist before proceeding with revalidation.
+	// This handles the case where pruner has removed subtree data for old invalid blocks.
+	var baseURL string
+	if u.p2pClient != nil {
+		if peer, err := u.p2pClient.GetPeer(ctx, blockHeaderMeta.PeerID); err != nil {
+			u.logger.Warnf("[RevalidateBlock][%s] failed to get peer %s for DataHubURL, will use fallback peers: %v", block.String(), blockHeaderMeta.PeerID, err)
+		} else if peer != nil {
+			baseURL = peer.DataHubURL
+		}
+		if _, err := u.fetchSubtreeDataForBlock(ctx, block, blockHeaderMeta.PeerID, baseURL); err != nil {
+			return nil, errors.WrapGRPC(errors.NewServiceError("[RevalidateBlock][%s] failed to fetch missing subtree data", block.String(), err))
+		}
+	}
+
 	// Create validation options
 	opts := &ValidateBlockOptions{
 		DisableOptimisticMining: true,
 		IsRevalidation:          true,
+		PeerID:                  blockHeaderMeta.PeerID,
 	}
 
-	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, blockHeaderMeta.PeerID, opts)
+	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, baseURL, opts)
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewServiceError("[RevalidateBlock][%s] failed block re-validation", block.String(), err))
 	}
@@ -1227,6 +1251,13 @@ func (u *Server) ProcessBlock(ctx context.Context, request *blockvalidation_api.
 	}
 
 	block.Height = height
+
+	// If a block ID was pre-assigned by the caller (e.g. legacy netsync in LEGACYSYNCING mode),
+	// apply it so the validation path can use AddBlock(WithID, WithMinedSet(true)) and allow
+	// the setMinedChan worker to skip setTxMinedStatus via the existing MinedSet guard.
+	if request.BlockId != 0 {
+		block.ID = request.BlockId
+	}
 
 	baseURL := request.BaseUrl
 	if baseURL == "" {
@@ -1288,7 +1319,9 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 
 	oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
-	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings); !ok {
+	// Create meta regenerator for potential meta file recovery (no peer URL for gRPC, local store only)
+	metaRegenerator := u.blockValidation.createMetaRegenerator(nil)
+	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err))
 	}
 
@@ -1388,6 +1421,7 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	opts := &ValidateBlockOptions{
 		DisableOptimisticMining: baseURL == "legacy",
 		IsRevalidation:          false, // processBlockFound is for new blocks, not revalidation
+		PeerID:                  peerID,
 	}
 
 	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, baseURL, opts)

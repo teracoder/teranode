@@ -1,5 +1,5 @@
 /*
-Package validator implements Bitcoin SV transaction validation functionality.
+Package validator implements BSV Blockchain transaction validation functionality.
 
 This file contains the core transaction validation logic and implements the standard
 Bitcoin transaction validation rules and policies. The TxValidator component is responsible
@@ -10,7 +10,7 @@ The implementation supports multiple script interpreters through a plugin archit
 allowing different script verification engines to be used based on configuration. Currently
 supported interpreters include:
 - Go-BT: Pure Go implementation from the libsv/go-bt library
-- Go-SDK: Bitcoin SV SDK implementation
+- Go-SDK: BSV SDK implementation
 - Go-BDK: Bitcoin Development Kit implementation
 
 The validation process enforces rules including but not limited to:
@@ -28,6 +28,8 @@ different validation scenarios from development to high-volume production enviro
 package validator
 
 import (
+	"math"
+
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/bscript/interpreter"
@@ -52,6 +54,27 @@ const (
 	TxInterpreterGoBDK TxInterpreter = "GoBDK"
 )
 
+// BIP68 sequence lock constants
+// These constants are used for relative lock-time enforcement via input sequence numbers
+const (
+	// SequenceLockTimeDisableFlag is the flag bit that disables the relative locktime feature
+	// If this bit is set, the sequence number is not interpreted as a relative lock-time
+	SequenceLockTimeDisableFlag uint32 = 1 << 31
+
+	// SequenceLockTimeTypeFlag is the flag bit that determines the lock-time type
+	// If set, the sequence number specifies a relative time lock in 512-second units
+	// If not set, the sequence number specifies a relative block height lock
+	SequenceLockTimeTypeFlag uint32 = 1 << 22
+
+	// SequenceLockTimeMask is the bitmask to extract the lock-time value from sequence number
+	// Only the lower 16 bits are used for the actual lock-time value
+	SequenceLockTimeMask uint32 = 0x0000ffff
+
+	// SequenceLockTimeGranularity is the granularity for time-based sequence locks
+	// Time-based locks use 512-second (2^9 seconds) granularity
+	SequenceLockTimeGranularity = 9
+)
+
 // TxValidatorI defines the interface for transaction validation operations.
 // This interface serves as the contract for all transaction validators, abstracting
 // the implementation details from the rest of the system. This enables different
@@ -62,11 +85,12 @@ const (
 // policy rules across the full range of transaction properties. This includes
 // script verification, size limits, fee policies, and structure validation.
 type TxValidatorI interface {
-	// ValidateTransaction performs comprehensive validation of a transaction.
-	// This method enforces all consensus and policy rules against the transaction,
-	// including format, structure, inputs/outputs, signature verification, and fees.
-	// The validation context includes the current blockchain height and configuration
-	// options that may modify validation behavior (e.g., skip certain checks).
+	// ValidateTransaction performs comprehensive validation of a transaction,
+	// excluding BIP68 sequence-lock checks. This method enforces all consensus
+	// and policy rules including format, structure, inputs/outputs, script
+	// verification, and fees. BIP68 validation is performed separately via
+	// ValidateBIP68 so that MTP lookups are skipped when the transaction fails
+	// normal validation first.
 	//
 	// Parameters:
 	//   - tx: The transaction to validate, must be properly initialized
@@ -76,6 +100,21 @@ type TxValidatorI interface {
 	// Returns:
 	//   - error: Specific validation error with reason if validation fails, nil on success
 	ValidateTransaction(tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, validationOptions *Options) error
+
+	// ValidateBIP68 verifies that BIP68 relative lock-time constraints are satisfied.
+	// This must only be called for block validation (SkipPolicyChecks=true) and only
+	// after ValidateTransaction succeeds. Keeping BIP68 separate avoids the cost of
+	// MTP lookups when the transaction fails normal validation.
+	//
+	// Parameters:
+	//   - tx: The transaction to validate
+	//   - blockHeight: Height of the block being validated
+	//   - utxoHeights: Block heights where each input UTXO was created
+	//   - utxoMTPs: Median Time Past values for each UTXO height (stored_mtp(utxoHeight))
+	//   - blockMTP: Median Time Past for the block (stored_mtp(blockHeight-1))
+	// Returns:
+	//   - error: Validation error if sequence locks are not satisfied, nil on success
+	ValidateBIP68(tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, utxoMTPs []uint32, blockMTP uint32) error
 
 	// ValidateTransactionScripts performs script validation for a transaction.
 	// This method specifically handles the script execution and signature verification
@@ -164,7 +203,8 @@ func NewTxValidator(logger ulogger.Logger, tSettings *settings.Settings, opts ..
 	}
 }
 
-// ValidateTransaction performs comprehensive validation of a transaction
+// ValidateTransaction performs comprehensive validation of a transaction,
+// excluding BIP68 sequence-lock checks (use ValidateBIP68 for that).
 // This includes checking:
 //  1. Input and output presence
 //  2. Transaction size limits
@@ -178,6 +218,8 @@ func NewTxValidator(logger ulogger.Logger, tSettings *settings.Settings, opts ..
 // Parameters:
 //   - tx: The transaction to validate
 //   - blockHeight: Current block height for validation context
+//   - utxoHeights: Block heights where each input UTXO was created
+//   - validationOptions: Optional validation options
 //
 // Returns:
 //   - error: Any validation errors encountered
@@ -192,16 +234,15 @@ func (tv *TxValidator) ValidateTransaction(tx *bt.Tx, blockHeight uint32, utxoHe
 		return errors.NewTxInvalidError("transaction has no inputs or outputs")
 	}
 
-	// 2) The transaction size in bytes is less than maxtxsizepolicy.
-	if !validationOptions.SkipPolicyChecks {
-		if err := tv.checkTxSize(txSize); err != nil {
-			return err
-		}
+	// 2) Check transaction size against both consensus and policy limits
+	// Consensus limits are ALWAYS checked, policy limits only for mempool transactions
+	if err := tv.checkTxSize(txSize, blockHeight, validationOptions.SkipPolicyChecks); err != nil {
+		return err
 	}
 
 	// 3) check that each input value, as well as the sum, are in the allowed range of values (less than 21m coins)
 	// 5) None of the inputs have hash=0, N=–1 (coinbase transactions should not be relayed)
-	if err := tv.checkInputs(tx, blockHeight); err != nil {
+	if err := tv.checkInputs(tx, blockHeight, validationOptions); err != nil {
 		return err
 	}
 
@@ -223,17 +264,6 @@ func (tv *TxValidator) ValidateTransaction(tx *bt.Tx, blockHeight uint32, utxoHe
 	// 	return err
 	// }
 
-	// SAO - https://bitcoin.stackexchange.com/questions/83805/did-the-introduction-of-verifyscript-cause-a-backwards-incompatible-change-to-co
-	// SAO - The rule enforcing that unlocking scripts must be "push only" became more relevant and started being enforced with the
-	//       introduction of Segregated Witness (SegWit) which activated at height 481824.  BCH Forked before this at height 478559
-	//       and therefore let's not enforce this check until then.
-	if tv.interpreter.Interpreter() != TxInterpreterGoBDK && blockHeight > tv.settings.ChainCfgParams.UahfForkHeight {
-		// 9) The unlocking script (scriptSig) can only push numbers on the stack
-		if err := tv.pushDataCheck(tx); err != nil {
-			return err
-		}
-	}
-
 	// 10) Reject if the sum of input values is less than sum of output values
 	// 11) Reject if transaction fee would be too low (minRelayTxFee) to get into an empty block.
 	if !validationOptions.SkipPolicyChecks {
@@ -243,6 +273,14 @@ func (tv *TxValidator) ValidateTransaction(tx *bt.Tx, blockHeight uint32, utxoHe
 	}
 
 	return nil
+}
+
+// ValidateBIP68 verifies that BIP68 relative lock-time constraints are satisfied.
+// Must be called separately after ValidateTransaction succeeds, and only for block
+// validation (SkipPolicyChecks=true). This separation avoids the cost of MTP lookups
+// when a transaction fails normal validation.
+func (tv *TxValidator) ValidateBIP68(tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, utxoMTPs []uint32, blockMTP uint32) error {
+	return tv.sequenceLocks(tx, blockHeight, utxoHeights, utxoMTPs, blockMTP)
 }
 
 // ValidateTransactionScripts performs script validation for all transaction inputs.
@@ -271,6 +309,131 @@ func (tv *TxValidator) ValidateTransactionScripts(tx *bt.Tx, blockHeight uint32,
 	return nil
 }
 
+// sequenceLocks verifies that relative lock-time constraints (BIP68) are satisfied for block validation.
+// This function implements the SequenceLocks check from SV Node validation.cpp.
+//
+// BIP68 allows transaction inputs to specify minimum block heights or times before they can be spent
+// using the sequence number field. This enables relative lock-times for smart contracts and
+// payment channels.
+//
+// Parameters:
+//   - tx: The transaction to validate
+//   - blockHeight: Height of the block being validated
+//   - utxoHeights: Heights where each input UTXO was created
+//   - utxoMTPs: Median Time Past values for inputHeight for each UTXO
+//   - blockMTP: Median Time Past value for blockHeight
+//
+// Returns:
+//   - error: Validation error if sequence locks are not satisfied, nil on success
+func (tv *TxValidator) sequenceLocks(tx *bt.Tx, blockHeight uint32, utxoHeights []uint32, utxoMTPs []uint32, blockMTP uint32) error {
+	// BIP68 is only active from CSVHeight onwards.
+	// BSV C++ block validation: if (pindex_->GetHeight() >= consensusParams.CSVHeight)
+	if blockHeight < tv.settings.ChainCfgParams.CSVHeight {
+		return nil
+	}
+
+	// BSV Genesis restored the original Bitcoin semantics for nSequence: it is
+	// used for RBF signalling only, not for relative lock-time enforcement. The
+	// reference implementation drops LOCKTIME_VERIFY_SEQUENCE post-Genesis (see
+	// src/policy/policy.h::StandardNonFinalVerifyFlags and
+	// src/validation.cpp::CheckSequenceLocks), which makes CalculateSequenceLocks
+	// a no-op. Mirror that here so blocks containing non-zero-sequence inputs are
+	// accepted post-Genesis.
+	//
+	// Note on >= vs >: This check uses >= to match BSV's IsGenesisEnabled()
+	// semantics (the activation block itself is considered post-Genesis). That
+	// differs from checkOutputs() below, which uses > because mainnet block
+	// 620538's outputs were created before Genesis rules existed and must not be
+	// retroactively rejected. The two predicates are intentionally different:
+	// checkOutputs gates a backward-incompatible output-shape rule (P2SH/dust)
+	// and exempts the activation block for continuity, whereas sequenceLocks
+	// disables a now-obsolete consensus rule and must match the reference
+	// implementation's boundary exactly.
+	if blockHeight >= tv.settings.ChainCfgParams.GenesisActivationHeight {
+		return nil
+	}
+
+	// Version 2 transactions are required for BIP68
+	// Transactions with version < 2 bypass relative lock-time enforcement
+	if tx.Version < 2 {
+		return nil
+	}
+
+	// Calculate sequence locks - find the minimum block height and time.
+	// Initial value -1 means "no constraint": the semantics of nLockTime are the
+	// last INVALID height/time, so -1 means any height or time is valid.
+	// This matches BSV C++: int32_t nMinHeight = -1; int64_t nMinTime = -1;
+	minHeight := int32(-1)
+	minTime := int64(-1)
+
+	// Process each input to determine lock requirements
+	for i, input := range tx.Inputs {
+		// If sequence has the disable flag set, skip this input
+		if input.SequenceNumber&SequenceLockTimeDisableFlag != 0 {
+			continue
+		}
+
+		// Extract the lock value from the sequence number (lower 16 bits)
+		sequenceMasked := input.SequenceNumber & SequenceLockTimeMask
+
+		// Check if this is a time-based or height-based lock
+		if input.SequenceNumber&SequenceLockTimeTypeFlag != 0 {
+			// Time-based relative lock-time
+			// Calculate the minimum time required using the UTXO's MTP
+			if i >= len(utxoMTPs) {
+				return errors.NewTxInvalidError("missing MTP value for input %d", i)
+			}
+
+			// Time is in 512-second units (2^9 seconds)
+			// Add the relative time offset to the UTXO's MTP
+			utxoMTP := int64(utxoMTPs[i])
+			nTxTime := utxoMTP + (int64(sequenceMasked) << SequenceLockTimeGranularity)
+
+			// Update minimum time if this input requires a later time
+			if nTxTime > minTime {
+				minTime = nTxTime
+			}
+		} else {
+			// Height-based relative lock-time
+			// Calculate the minimum height required
+			if i >= len(utxoHeights) {
+				return errors.NewTxInvalidError("missing height value for input %d", i)
+			}
+
+			// Add the relative height offset to the UTXO's height, minus 1
+			// (matching Bitcoin Core: nMinHeight = coinHeight + nSequence - 1,
+			// so the tx is valid starting from blockHeight >= coinHeight + nSequence)
+			nTxHeight := int32(utxoHeights[i]) + int32(sequenceMasked) - 1
+
+			// Update minimum height if this input requires a later height
+			if nTxHeight > minHeight {
+				minHeight = nTxHeight
+			}
+		}
+	}
+
+	// Evaluate the calculated locks against the block being validated
+	// The transaction can only be included if both height and time requirements are met
+
+	// Check height requirement: minimum required height must be less than current block height.
+	// blockHeight is uint32 but int32 conversion would wrap for values > math.MaxInt32; reject
+	// such heights as invalid since no realistic block will ever reach that range.
+	if blockHeight > math.MaxInt32 {
+		return errors.NewTxInvalidError("block height %d exceeds maximum safe int32 value", blockHeight)
+	}
+	blockHeightInt32 := int32(blockHeight)
+	if minHeight >= blockHeightInt32 {
+		return errors.NewTxInvalidError("transaction sequence lock height not satisfied: required %d, current %d", minHeight, blockHeight)
+	}
+
+	// Check time requirement: minimum required time must be less than block's MTP
+	if minTime >= int64(blockMTP) {
+		return errors.NewTxInvalidError("transaction sequence lock time not satisfied: required %d, current %d", minTime, blockMTP)
+	}
+
+	return nil
+}
+
 // isUnspendableOutput checks if an output script is unspendable (starts with OP_FALSE OP_RETURN)
 func isUnspendableOutput(script *bscript.Script) bool {
 	if script == nil {
@@ -286,63 +449,15 @@ func isUnspendableOutput(script *bscript.Script) bool {
 	return false
 }
 
-// isStandardInputScript checks if an input script (unlocking script) is standard
-// Standard input scripts should only contain data pushes (no other opcodes)
-// This uses the same interpreter as the SV node for consistency
-// Before UAHF height, all scripts are considered standard (no push-only requirement)
-func isStandardInputScript(script *bscript.Script, blockHeight uint32, uahfHeight uint32) bool {
-	// Before UAHF, there was no push-only requirement for input scripts
-	if blockHeight <= uahfHeight {
-		// Any parseable script is considered standard before UAHF
-		// Return true unless script is nil
-		return script != nil
-	}
-
-	if script == nil {
-		// Nil scripts are not standard (matches pushDataCheck behavior)
-		return false
-	}
-
-	// Use the same parser as pushDataCheck for consistency
-	parser := interpreter.DefaultOpcodeParser{}
-	parsedScript, err := parser.Parse(script)
-	if err != nil {
-		// If we can't parse the script, it's not standard
-		return false
-	}
-
-	// Check if the parsed script is push-only
-	return parsedScript.IsPushOnly()
-}
-
 // checkOutputs validates transaction outputs according to consensus and policy rules.
 func (tv *TxValidator) checkOutputs(tx *bt.Tx, blockHeight uint32, validationOptions *Options) error {
 	total := uint64(0)
 
-	// Note: We use > instead of >= to exclude the Genesis activation block itself
-	// because transactions in block 620538 were created before Genesis rules existed
-	isGenesisActivated := blockHeight > tv.settings.ChainCfgParams.GenesisActivationHeight
-
 	for index, output := range tx.Outputs {
-		// Check P2SH output after genesis activation
-		if !validationOptions.SkipPolicyChecks && isGenesisActivated && output.LockingScript.IsP2SH() {
-			// See https://github.com/bitcoin-sv/teranode/issues/4333
-			return errors.NewTxInvalidError("transaction output %d is p2sh after genesis activation", index)
-		}
 
 		if output.Satoshis > MaxSatoshis {
 			return errors.NewTxInvalidError("transaction output %d satoshis is invalid", index)
 		}
-
-		// Check dust limit after genesis activation
-		// Dust checks are policy rules, not consensus rules - they only apply to mempool/relay
-		if !validationOptions.SkipPolicyChecks && isGenesisActivated {
-			// Only enforce dust limit for spendable outputs when RequireStandard is true
-			if tv.settings.ChainCfgParams.RequireStandard && output.Satoshis < DustLimit && !isUnspendableOutput(output.LockingScript) {
-				return errors.NewTxInvalidError("zero-satoshi outputs require 'OP_FALSE OP_RETURN' prefix")
-			}
-		}
-
 		total += output.Satoshis
 	}
 
@@ -354,8 +469,10 @@ func (tv *TxValidator) checkOutputs(tx *bt.Tx, blockHeight uint32, validationOpt
 }
 
 // checkInputs validates transaction inputs according to consensus rules.
-func (tv *TxValidator) checkInputs(tx *bt.Tx, blockHeight uint32) error {
+func (tv *TxValidator) checkInputs(tx *bt.Tx, blockHeight uint32, validationOptions *Options) error {
 	total := uint64(0)
+	accumulatedPrevUTXOSize := uint64(0)
+	maxCoinsViewCacheSize := tv.settings.Policy.GetMaxCoinsViewCacheSize()
 
 	// blockHeight is not used, but it is required by the interface
 	_ = blockHeight
@@ -399,6 +516,20 @@ func (tv *TxValidator) checkInputs(tx *bt.Tx, blockHeight uint32) error {
 		}
 
 		total += input.PreviousTxSatoshis
+
+		// Check accumulated previous utxo size if maxcoinsviewcachesize is enabled
+		// See BSV Node CCoinsViewCache::Shard::HaveInputsLimited
+		//    https://github.com/teranode-group/bitcoin-sv-staging/blob/develop/src/coins.cpp#L131
+		if !validationOptions.SkipPolicyChecks && maxCoinsViewCacheSize > 0 {
+			if input.PreviousTxScript == nil {
+				return errors.NewTxPolicyError("bad-txns-inputs-too-large")
+			}
+
+			accumulatedPrevUTXOSize += uint64(len(*input.PreviousTxScript))
+			if accumulatedPrevUTXOSize > maxCoinsViewCacheSize {
+				return errors.NewTxPolicyError("bad-txns-inputs-too-large")
+			}
+		}
 	}
 
 	// if total == 0 && blockHeight >= tv.Params().GenesisActivationHeight {
@@ -413,16 +544,44 @@ func (tv *TxValidator) checkInputs(tx *bt.Tx, blockHeight uint32) error {
 	return nil
 }
 
-// checkTxSize validates that the transaction size complies with policy limits.
-func (tv *TxValidator) checkTxSize(txSize int) error {
-	maxTxSizePolicy := tv.settings.Policy.GetMaxTxSizePolicy()
-	if maxTxSizePolicy == 0 {
-		// no policy found for tx size, use max block size
-		maxTxSizePolicy = MaxBlockSize
+// checkTxSize validates that the transaction size complies with consensus and policy limits.
+// This method enforces two types of checks:
+// 1. Consensus check (ALWAYS enforced): Ensures transaction doesn't exceed consensus size limit
+//   - Before Genesis: 1 MB (MaxTxSizeConsensusBeforeGenesis)
+//   - After Genesis: 1 GB (MaxTxSizeConsensusAfterGenesis)
+//   - Matches C++ bitcoin-sv: CheckTransactionCommon in validation.cpp:536
+//
+// 2. Policy check (only when skipPolicy=false): Ensures transaction doesn't exceed policy size limit
+//
+// Parameters:
+//   - txSize: The transaction size in bytes
+//   - blockHeight: Current block height to determine if Genesis is active
+//   - skipPolicy: If true, skip policy checks (used for block validation)
+func (tv *TxValidator) checkTxSize(txSize int, blockHeight uint32, skipPolicy bool) error {
+	// Consensus check: ALWAYS enforced regardless of skipPolicy
+	// Matches C++ bitcoin-sv implementation: CheckTransactionCommon in validation.cpp:536
+	// where it checks: if (::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION) > maxTxSizeConsensus)
+	genesisActivationHeight := tv.settings.ChainCfgParams.GenesisActivationHeight
+	isPostGenesis := blockHeight >= genesisActivationHeight
+	maxTxSizeConsensus := MaxTxSizeConsensusBeforeGenesis
+	if isPostGenesis {
+		maxTxSizeConsensus = MaxTxSizeConsensusAfterGenesis
+	}
+	if txSize > maxTxSizeConsensus {
+		return errors.NewTxInvalidError("bad-txns-oversize")
 	}
 
-	if txSize > maxTxSizePolicy {
-		return errors.NewTxInvalidError("transaction size in bytes is greater than max tx size policy %d", maxTxSizePolicy)
+	// Policy check: Only enforced for mempool transactions (when skipPolicy=false)
+	if !skipPolicy {
+		maxTxSizePolicy := tv.settings.Policy.GetMaxTxSizePolicy()
+		if maxTxSizePolicy == 0 {
+			// no policy found for tx size, use max block size
+			maxTxSizePolicy = MaxBlockSize
+		}
+
+		if txSize > maxTxSizePolicy {
+			return errors.NewTxInvalidError("transaction size in bytes is greater than max tx size policy %d", maxTxSizePolicy)
+		}
 	}
 
 	return nil
@@ -461,7 +620,7 @@ func (tv *TxValidator) checkFees(tx *bt.Tx, blockHeight uint32, utxoHeights []ui
 	txSize := tx.Size()
 	minRequiredFee := uint64(satoshisPerByte * float64(txSize))
 
-	// Ensure minimum 1 satoshi for non-zero sized transactions (matching Bitcoin SV)
+	// Ensure minimum 1 satoshi for non-zero sized transactions (matching SV Node)
 	if minRequiredFee == 0 && txSize > 0 && minFeeRateBSVPerKB > 0 {
 		minRequiredFee = 1
 	}
@@ -504,7 +663,7 @@ func (tv *TxValidator) isDustReturnTx(tx *bt.Tx) bool {
 }
 
 // isConsolidationTx checks if a transaction qualifies as a consolidation transaction
-// following Bitcoin SV rules.
+// following Bitcoin rules.
 //
 // Parameters:
 //   - tx: The transaction to check
@@ -541,7 +700,7 @@ func (tv *TxValidator) isConsolidationTx(tx *bt.Tx, utxoHeights []uint32, curren
 		return false
 	}
 
-	// Rule 2: Script Size Comparison (Bitcoin SV rule)
+	// Rule 2: Script Size Comparison (Bitcoin rule)
 	// Sum of input scriptPubKey sizes >= minConsolidationFactor × sum of output scriptPubKey sizes
 	if !isDustReturn {
 		// Check if transaction is extended (has PreviousTxScript for all inputs)
@@ -581,7 +740,6 @@ func (tv *TxValidator) isConsolidationTx(tx *bt.Tx, utxoHeights []uint32, curren
 	// Get configuration settings
 	minConf := tv.settings.Policy.GetMinConfConsolidationInput()
 	maxInputScriptSize := tv.settings.Policy.GetMaxConsolidationInputScriptSize()
-	acceptNonStdInputs := tv.settings.Policy.GetAcceptNonStdConsolidationInput()
 
 	// Dust return transactions don't require confirmations
 	if isDustReturn {
@@ -611,9 +769,7 @@ func (tv *TxValidator) isConsolidationTx(tx *bt.Tx, utxoHeights []uint32, curren
 
 		// Rule 5: Standard Script Rule
 		// If acceptNonStdConsolidationInput = 0, all inputs must use standard scripts
-		if !acceptNonStdInputs && !isStandardInputScript(input.UnlockingScript, currentHeight, tv.settings.ChainCfgParams.UahfForkHeight) {
-			return false
-		}
+		// This is checked in bdk
 	}
 
 	// Transaction qualifies as a consolidation transaction
@@ -645,28 +801,6 @@ func (tv *TxValidator) sigOpsCheck(tx *bt.Tx, validationOptions *Options) error 
 					return errors.NewTxInvalidError("transaction unlocking scripts have too many sigops (%d)", numSigOps)
 				}
 			}
-		}
-	}
-
-	return nil
-}
-
-// pushDataCheck validates that transaction input scripts contain only data pushes.
-func (tv *TxValidator) pushDataCheck(tx *bt.Tx) error {
-	for index, input := range tx.Inputs {
-		if input.UnlockingScript == nil {
-			return errors.NewTxInvalidError("transaction input %d unlocking script is empty", index)
-		}
-
-		parser := interpreter.DefaultOpcodeParser{}
-		parsedUnlockingScript, err := parser.Parse(input.UnlockingScript)
-
-		if err != nil {
-			return err
-		}
-
-		if !parsedUnlockingScript.IsPushOnly() {
-			return errors.NewTxInvalidError("transaction input %d unlocking script is not push only", index)
 		}
 	}
 

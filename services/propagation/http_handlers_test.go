@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -212,6 +213,7 @@ func setupPropagationServer(t *testing.T, mockValidator validator.Interface, sto
 			blockchainClient: mockBlockchainClient,
 			txStore:          mockStore,
 			stats:            stats,
+			settings:         &settings.Settings{Policy: &settings.PolicySettings{}},
 		},
 	}
 
@@ -251,9 +253,44 @@ func TestHandleSingleTx(t *testing.T) {
 		{
 			name:                "Transaction validation error",
 			requestBody:         txBytes,
-			expectedStatusCode:  http.StatusInternalServerError,
+			expectedStatusCode:  http.StatusBadRequest,
 			expectedResponse:    "Failed to process transaction",
 			mockValidationError: errors.NewTxInvalidError("test validation error"),
+		},
+		{
+			name:                "Tx policy rejection",
+			requestBody:         txBytes,
+			expectedStatusCode:  http.StatusBadRequest,
+			expectedResponse:    "Failed to process transaction",
+			mockValidationError: errors.NewTxPolicyError("test policy error"),
+		},
+		{
+			name:                "Double-spend conflict",
+			requestBody:         txBytes,
+			expectedStatusCode:  http.StatusConflict,
+			expectedResponse:    "Failed to process transaction",
+			mockValidationError: errors.NewTxInvalidDoubleSpendError("test double spend"),
+		},
+		{
+			name:                "Conflicting tx",
+			requestBody:         txBytes,
+			expectedStatusCode:  http.StatusConflict,
+			expectedResponse:    "Failed to process transaction",
+			mockValidationError: errors.NewTxConflictingError("test conflicting"),
+		},
+		{
+			name:                "Frozen utxo",
+			requestBody:         txBytes,
+			expectedStatusCode:  http.StatusForbidden,
+			expectedResponse:    "Failed to process transaction",
+			mockValidationError: errors.NewUtxoFrozenError("test frozen"),
+		},
+		{
+			name:                "Wrapped tx-invalid through processing error",
+			requestBody:         txBytes,
+			expectedStatusCode:  http.StatusBadRequest,
+			expectedResponse:    "Failed to process transaction",
+			mockValidationError: errors.NewProcessingError("validator wrap", errors.NewTxInvalidError("inner reason")),
 		},
 		{
 			name:               "Store error",
@@ -419,11 +456,11 @@ func TestHTTPIntegration(t *testing.T) {
 	// Create a minimal PropagationServer with just the dependencies needed for the test
 	ps := &MockPropagationServer{
 		PropagationServer: PropagationServer{
-			logger:    ulogger.New("test-logger"),
-			validator: mockValidator,
-			txStore:   mockStore,
-			// blockchainClient: &CustomMockBlockchainClient{},
+			logger:           ulogger.New("test-logger"),
+			validator:        mockValidator,
+			txStore:          mockStore,
 			blockchainClient: &blockchain.Mock{},
+			settings:         &settings.Settings{Policy: &settings.PolicySettings{}},
 		},
 	}
 

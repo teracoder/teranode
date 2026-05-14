@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -217,7 +218,7 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 	// Set up mock settings
 	server.settings = &settings.Settings{
 		Pruner: settings.PrunerSettings{
-			BlobDeletionEnabled:      true,
+			SkipBlobDeletion:         false,
 			BlobDeletionSafetyWindow: 0,
 			BlobDeletionBatchSize:    100,
 			BlobDeletionMaxRetries:   3,
@@ -282,7 +283,7 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 
 	// Process deletions at height 10
 	t.Log("Processing deletions at height 10")
-	server.processBlobDeletionsAtHeight(10)
+	server.processBlobDeletionsAtHeight(10, chainhash.Hash{})
 
 	// Wait for completion via observer
 	event, err := observer.waitFor(5 * time.Second)
@@ -318,7 +319,7 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 
 	// Process deletions at height 20
 	t.Log("Processing deletions at height 20")
-	server.processBlobDeletionsAtHeight(20)
+	server.processBlobDeletionsAtHeight(20, chainhash.Hash{})
 
 	// Wait for completion
 	event, err = observer.waitFor(5 * time.Second)
@@ -337,6 +338,112 @@ func TestBlobDeletionSchedulingAndExecution(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, len(deletions), "Queue should be completely empty")
 	t.Log("✓ All deletions processed, queue empty")
+}
+
+// TestBlobDeletionSafetyWindowBoundary verifies that blob deletions are skipped when
+// blockHeight <= safetyWindow, and only processed once blockHeight exceeds the window.
+func TestBlobDeletionSafetyWindowBoundary(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+	logger := ulogger.New("test")
+
+	mockBlockchain := newMockBlockchainClient()
+
+	testDir := t.TempDir()
+	storeURL := &url.URL{
+		Scheme: "file",
+		Path:   filepath.Join(testDir, "blobs"),
+	}
+
+	testStore, err := blob.NewStore(logger, storeURL)
+	require.NoError(t, err)
+
+	blobStores := map[storetypes.BlobStoreType]blob.Store{
+		storetypes.TXSTORE: testStore,
+	}
+
+	observer := &testBlobDeletionObserver{
+		t:        t,
+		complete: make(chan blobDeletionEvent, 10),
+	}
+
+	server := &Server{
+		ctx:                  ctx,
+		logger:               logger,
+		blobStores:           blobStores,
+		blockchainClient:     mockBlockchain,
+		blobDeletionObserver: observer,
+	}
+
+	server.settings = &settings.Settings{
+		Pruner: settings.PrunerSettings{
+			SkipBlobDeletion:         false,
+			BlobDeletionSafetyWindow: 5,
+			BlobDeletionBatchSize:    100,
+			BlobDeletionMaxRetries:   3,
+		},
+	}
+
+	// Create and store a test blob
+	testKey := make([]byte, 32)
+	_, err = rand.Read(testKey)
+	require.NoError(t, err)
+
+	err = testStore.Set(ctx, testKey, fileformat.FileTypeTesting, []byte("safety window test blob"))
+	require.NoError(t, err)
+
+	// Schedule deletion at height 3
+	_, scheduled, err := mockBlockchain.ScheduleBlobDeletion(ctx, testKey, string(fileformat.FileTypeTesting), storetypes.TXSTORE, 3)
+	require.NoError(t, err)
+	require.True(t, scheduled)
+
+	// Process at height 3 (blockHeight <= safetyWindow=5): should skip all deletions
+	t.Log("Processing at height 3 (blockHeight <= safetyWindow=5): should skip")
+	server.processBlobDeletionsAtHeight(3, chainhash.Hash{})
+
+	// Observer should NOT fire — processBlobDeletionsAtHeight is synchronous, so
+	// if it were going to enqueue an event it would have done so before returning.
+	select {
+	case <-observer.complete:
+		t.Fatal("Expected no deletion event when blockHeight <= safetyWindow")
+	default:
+		t.Log("Correctly skipped deletions when blockHeight <= safetyWindow")
+	}
+
+	// Verify blob still exists
+	exists, err := testStore.Exists(ctx, testKey, fileformat.FileTypeTesting)
+	require.NoError(t, err)
+	require.True(t, exists, "Blob should still exist when blockHeight <= safetyWindow")
+
+	// Process at height 5 (blockHeight == safetyWindow): should still skip
+	t.Log("Processing at height 5 (blockHeight == safetyWindow): should skip")
+	server.processBlobDeletionsAtHeight(5, chainhash.Hash{})
+
+	select {
+	case <-observer.complete:
+		t.Fatal("Expected no deletion event when blockHeight == safetyWindow")
+	default:
+		t.Log("Correctly skipped deletions when blockHeight == safetyWindow")
+	}
+
+	exists, err = testStore.Exists(ctx, testKey, fileformat.FileTypeTesting)
+	require.NoError(t, err)
+	require.True(t, exists, "Blob should still exist when blockHeight == safetyWindow")
+
+	// Process at height 8 (blockHeight=8 > safetyWindow=5, safeHeight=3, DAH=3 <= 3): should delete
+	t.Log("Processing at height 8 (safeHeight=3, DAH=3): should delete")
+	server.processBlobDeletionsAtHeight(8, chainhash.Hash{})
+
+	event, err := observer.waitFor(5 * time.Second)
+	require.NoError(t, err)
+	require.Equal(t, uint32(8), event.height)
+	require.Equal(t, int64(1), event.successCount, "Should delete 1 blob")
+
+	exists, err = testStore.Exists(ctx, testKey, fileformat.FileTypeTesting)
+	require.NoError(t, err)
+	require.False(t, exists, "Blob should be deleted once blockHeight > safetyWindow and safeHeight >= DAH")
+	t.Log("Correctly deleted blob after safety window satisfied")
 }
 
 // TestBlobDeletionIdempotency verifies that deleting an already-deleted blob doesn't error.
@@ -377,9 +484,10 @@ func TestBlobDeletionIdempotency(t *testing.T) {
 
 	server.settings = &settings.Settings{
 		Pruner: settings.PrunerSettings{
-			BlobDeletionEnabled:    true,
-			BlobDeletionBatchSize:  100,
-			BlobDeletionMaxRetries: 3,
+			SkipBlobDeletion:         false,
+			BlobDeletionSafetyWindow: 0,
+			BlobDeletionBatchSize:    100,
+			BlobDeletionMaxRetries:   3,
 		},
 	}
 
@@ -408,7 +516,7 @@ func TestBlobDeletionIdempotency(t *testing.T) {
 	t.Logf("Scheduled deletion of already-deleted blob, id=%d", id)
 
 	// Process deletions (should handle gracefully)
-	server.processBlobDeletionsAtHeight(10)
+	server.processBlobDeletionsAtHeight(10, chainhash.Hash{})
 
 	// Wait for completion (blob already deleted, so it should succeed idempotently)
 	event, err := observer.waitFor(5 * time.Second)
