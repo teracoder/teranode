@@ -387,6 +387,16 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 
 	apiGroup.GET("/utxos/:hash/json", h.GetUTXOsByTxID(JSON))
 
+	// Bulk UTXO spend-status lookup. All three modes accept the same 36-byte
+	// binary request body; only the response format differs. Routed through
+	// heavyMW() so a single request (up to 1024-way Aerospike fan-out) is
+	// gated by the same tiered rate limiter that protects /subtree/:hash/txs
+	// and other heavy endpoints. Body size is capped by the global
+	// asset_httpBodyLimit middleware.
+	apiGroup.POST("/utxos", h.GetUTXOs(BINARY_STREAM), heavyMW()...)
+	apiGroup.POST("/utxos/hex", h.GetUTXOs(HEX), heavyMW()...)
+	apiGroup.POST("/utxos/json", h.GetUTXOs(JSON), heavyMW()...)
+
 	apiGroup.GET("/bestblockheader", h.GetBestBlockHeader(BINARY_STREAM))
 	apiGroup.GET("/bestblockheader/hex", h.GetBestBlockHeader(HEX))
 	apiGroup.GET("/bestblockheader/json", h.GetBestBlockHeader(JSON))
