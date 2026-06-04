@@ -144,9 +144,7 @@ func InitTracer(appSettings *settings.Settings) error {
 		// Create trace provider with the exporter
 		tp = sdktrace.NewTracerProvider(
 			sdktrace.WithBatcher(exporter, sdktrace.WithBatchTimeout(time.Second)), // Send batches every second
-			sdktrace.WithSampler(newOverrideSampler(
-				sdktrace.ParentBased(sdktrace.TraceIDRatioBased(appSettings.TracingSampleRate)),
-			)),
+			sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(appSettings.TracingSampleRate))),
 			sdktrace.WithResource(res),
 		)
 
