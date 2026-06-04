@@ -100,6 +100,21 @@ type Store interface {
 	// Returns: Block, boolean indicating success, and any error encountered
 	GetBlockInChainByHeightHash(ctx context.Context, height uint32, startHash *chainhash.Hash) (*model.Block, bool, error)
 
+	// MainChainBlockHashesByHeights returns the hash of the main-chain block at
+	// each requested height, but only when startHash is itself on the main
+	// chain. The height ceiling is derived from startHash's own height (results
+	// are constrained to ancestors-of-or-equal-to startHash), so the result
+	// matches a recursive walk anchored at startHash. Returns ok=false (nil
+	// error) when startHash is a fork tip, the store is mid-rebuild, unknown, or
+	// any requested height is missing, so the caller can fall back to a
+	// per-height chain walk.
+	// Parameters:
+	//   - ctx: Context for the operation
+	//   - startHash: Hash identifying the chain (must be on the main chain for the fast path)
+	//   - heights: Heights to fetch (must be <= startHash's height)
+	// Returns: map of height to block hash, ok flag, and any error encountered
+	MainChainBlockHashesByHeights(ctx context.Context, startHash *chainhash.Hash, heights []uint32) (map[uint32]*chainhash.Hash, bool, error)
+
 	// GetBlockStats retrieves statistical information about blocks.
 	// Parameters:
 	//   - ctx: Context for the operation
