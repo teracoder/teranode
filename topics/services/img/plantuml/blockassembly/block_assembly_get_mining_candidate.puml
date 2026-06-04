@@ -1,0 +1,97 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant "Miner" as Miner
+participant "BlockAssemblyClient" as Client
+participant "BlockAssemblyServer" as Server
+entity "BlockAssembler" as Assembler
+entity "SubtreeProcessor" as SubtreeProc
+database "JobStore" as JobStore
+participant "BlockchainClient" as BlockchainClient
+
+== Background: Pre-computed Data Updates ==
+note over SubtreeProc
+  SubtreeProcessor atomically publishes
+  PrecomputedMiningData (subtree snapshots)
+  whenever a subtree completes or a block
+  is processed via updatePrecomputedMiningData()
+end note
+
+== Mining Candidate Request ==
+
+Miner -> Client : GetMiningCandidate(ctx)
+activate Client
+
+Client -> Server : GetMiningCandidate(ctx)
+activate Server
+
+Server -> BlockchainClient : IsFSMCurrentState(ctx, FSMStateRUNNING)
+activate BlockchainClient
+BlockchainClient --> Server : isRunning
+deactivate BlockchainClient
+
+Server -> Assembler : GetMiningCandidate(ctx)
+activate Assembler
+
+Assembler -> SubtreeProc : GetPrecomputedMiningData()
+note right: Atomic pointer read\n(lock-free, no channel sync)
+activate SubtreeProc
+SubtreeProc --> Assembler : return PrecomputedMiningData
+deactivate SubtreeProc
+
+alt Precomputed data has completed subtrees for current chain tip
+  Assembler -> Assembler : Use precomputed subtrees
+else No completed subtrees available
+  Assembler -> SubtreeProc : GetIncompleteSubtreeMiningData(ctx)
+  note right: On-demand snapshot\n(channel request to processing goroutine)
+  activate SubtreeProc
+  SubtreeProc --> Assembler : return incomplete subtree snapshot
+  deactivate SubtreeProc
+  alt Incomplete subtree has transactions
+    Assembler -> Assembler : Use incomplete subtree
+  else No transactions at all
+    Assembler --> Server : return empty block template
+  end
+end
+
+Assembler -> Assembler : filterSubtreesByMaxSize()
+Assembler -> Assembler : Compute derived values\n(fees, tx count, merkle proof)
+Assembler -> Assembler : getNextNbits()
+note right: Check difficulty adjustment
+Assembler -> Assembler : Calculate coinbaseValue\n(totalFees + blockSubsidy)
+
+Assembler --> Server : return mining candidate + subtrees
+deactivate Assembler
+
+Server -> JobStore : Set(*id, &subtreeprocessor.Job{...}, jobTTL)
+Server -> BlockchainClient : SendNotification(ctx, &blockchain.Notification{Type: NotificationType_MiningOn, ...})
+
+Server --> Client : Return mining candidate
+deactivate Server
+
+Client --> Miner : Return mining candidate
+deactivate Client
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml

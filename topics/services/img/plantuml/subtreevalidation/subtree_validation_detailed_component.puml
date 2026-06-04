@@ -1,0 +1,131 @@
+skinparam defaultTextAlignment center
+skinparam rectangle {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam component {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam database {
+  BackgroundColor #f2f2f2
+  BorderColor #999999
+  FontColor black
+  RoundCorner 10
+}
+skinparam shadowing false
+skinparam ArrowColor #666666
+
+@startuml Subtree_Validation_Component
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title Subtree Validation Service - Component Diagram
+
+Container_Boundary(subtree_validation, "Subtree Validation Service") {
+
+Component(grpc_server, "gRPC Server", "Go gRPC", "Handles external subtree validation API requests")
+
+Component(subtree_handler, "Subtree Handler", "Go", "Handles subtree validation requests with file-based locking and transaction fetching")
+
+Component(txmeta_handler, "TxMeta Handler", "Go", "Handles transaction metadata cache updates")
+
+Component(kafka_consumer_subtrees, "Subtree Consumer", "Go Kafka", "Consumes subtree notifications from P2P service")
+
+Component(kafka_consumer_txmeta, "TxMeta Consumer", "Go Kafka", "Consumes transaction metadata updates")
+
+Component(kafka_producer_invalid, "Invalid Subtree Producer", "Go Kafka", "Publishes invalid subtree notifications")
+
+Component(validator_client, "Validator Client", "Go", "Interface to Validator service for transaction validation")
+
+Component(blockchain_client, "Blockchain Client", "Go gRPC", "Interface to Blockchain service")
+
+Component(utxo_store_client, "UTXO Store Client", "Go", "Interface to UTXO store for metadata operations")
+
+Component(blob_stores, "Blob Store Clients", "Go", "Subtree and transaction blob storage interfaces")
+
+}
+
+Container_Boundary(external_services, "External Services") {
+
+Container(validator, "Validator Service", "Go", "Transaction validation")
+
+Container(blockchain, "Blockchain Service", "Go", "Blockchain state management")
+
+ContainerDb(subtree_store, "Subtree Store", "Blob Store", "Validated subtree storage")
+
+ContainerDb(tx_store, "Transaction Store", "Blob Store", "Transaction data storage")
+
+ContainerDb(utxo_store, "UTXO Store", "Database", "UTXO and transaction metadata")
+
+ContainerQueue(kafka, "Kafka", "Message Queue", "Message broker")
+
+Container(asset_servers, "Asset Servers", "HTTP", "Remote transaction data")
+
+}
+
+System_Ext(p2p_service, "P2P Service", "P2P network and subtree message publishing")
+
+System_Ext(block_validation, "Block Validation Service", "Block validation")
+
+System_Ext(legacy_service, "Legacy Service", "P2P sync and block processing")
+
+System_Ext(rpc_service, "RPC Service", "External API access")
+
+' External API interactions
+
+Rel(block_validation, grpc_server, "Validate subtrees", "gRPC")
+
+Rel(legacy_service, grpc_server, "Validate subtrees during sync", "gRPC")
+
+Rel(rpc_service, grpc_server, "External subtree validation requests", "gRPC")
+
+Rel(grpc_server, subtree_handler, "Route validation requests")
+
+' Kafka message flow
+
+Rel(p2p_service, kafka, "Publish subtree notifications", "Kafka")
+
+Rel(kafka, kafka_consumer_subtrees, "Subtree notifications", "Kafka")
+
+Rel(kafka, kafka_consumer_txmeta, "Metadata updates", "Kafka")
+
+Rel(kafka_producer_invalid, kafka, "Publish invalid subtrees", "Kafka")
+
+' Internal processing flow
+
+Rel(kafka_consumer_subtrees, subtree_handler, "Process subtrees")
+
+Rel(kafka_consumer_txmeta, txmeta_handler, "Process metadata")
+
+Rel(subtree_handler, validator_client, "Validate transactions")
+
+Rel(subtree_handler, blockchain_client, "Get block information")
+
+Rel(subtree_handler, blob_stores, "Read/write subtrees and transactions")
+
+Rel(subtree_handler, asset_servers, "Fetch missing transactions", "HTTP")
+
+Rel(subtree_handler, kafka_producer_invalid, "Report invalid subtrees")
+
+Rel(txmeta_handler, utxo_store_client, "Cache metadata")
+
+' External service connections
+
+Rel(validator_client, validator, "Transaction validation", "gRPC/Interface")
+
+Rel(blockchain_client, blockchain, "Blockchain queries", "gRPC")
+
+Rel(blob_stores, subtree_store, "Subtree operations", "Direct")
+
+Rel(blob_stores, tx_store, "Transaction operations", "Direct")
+
+Rel(utxo_store_client, utxo_store, "Metadata operations", "Direct")
+
+SHOW_LEGEND()
+
+@enduml

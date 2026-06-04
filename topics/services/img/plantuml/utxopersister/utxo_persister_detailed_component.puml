@@ -1,0 +1,107 @@
+skinparam defaultTextAlignment center
+skinparam rectangle {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam component {
+  BackgroundColor #e6f0ff
+  BorderColor #3366cc
+  FontColor black
+  RoundCorner 10
+}
+skinparam database {
+  BackgroundColor #f2f2f2
+  BorderColor #999999
+  FontColor black
+  RoundCorner 10
+}
+skinparam shadowing false
+skinparam ArrowColor #666666
+
+@startuml UTXO_Persister_Component
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title UTXO Persister Service - Component Diagram
+
+Container_Boundary(utxo_persister, "UTXO Persister Service") {
+
+Component(server, "Server", "Go", "Main service component handling notifications, block monitoring, and UTXO processing orchestration")
+
+Component(consolidator, "Consolidator Helper", "Go", "Temporary helper for consolidating block ranges during processing")
+
+
+
+Component(blockchain_client, "Blockchain Client", "Go gRPC", "Interface to Blockchain service")
+
+Component(blockchain_store_client, "Blockchain Store Client", "Go", "Direct blockchain store access (optional)")
+
+Component(block_store_client, "Block Store Client", "Go", "Interface to shared block storage")
+
+
+
+Component(file_storer, "File Storer", "Go", "Optimized UTXO file storage mechanism")
+
+}
+
+Container_Boundary(external_services, "External Services") {
+
+Container(blockchain, "Blockchain Service", "Go", "Blockchain state management")
+
+ContainerDb(block_store, "Final Block Store", "Blob Storage (S3)", "Shared blob storage")
+
+ContainerDb(blockchain_store, "Blockchain Store", "Database", "Blockchain data storage")
+
+Container(state_file, "State File", "Filesystem", "Local processing state")
+
+}
+
+Person(admin, "Administrator", "Node operator")
+
+System_Ext(block_persister, "Block Persister Service", "Produces enriched block data")
+
+' Notification and processing flow
+
+Rel(blockchain, server, "Block notifications", "gRPC")
+
+Rel(server, consolidator, "Create consolidator for block range processing")
+
+Rel(consolidator, file_storer, "Store UTXO set files")
+
+' Data access
+
+Rel(server, blockchain_client, "Subscribe to notifications and get block info")
+
+Rel(server, blockchain_store_client, "Get block headers (optional direct access)")
+
+Rel(server, block_store_client, "Read/write block and UTXO files")
+
+Rel(consolidator, blockchain_client, "Get block headers")
+
+Rel(consolidator, block_store_client, "Read UTXO additions/deletions")
+
+Rel(file_storer, block_store_client, "Store UTXO set files")
+
+' State management
+
+Rel(server, state_file, "Persist processing state (lastProcessed.dat)", "Filesystem")
+
+' External service connections
+
+Rel(blockchain_client, blockchain, "gRPC calls", "gRPC")
+
+Rel(blockchain_store_client, blockchain_store, "Direct access", "Direct")
+
+Rel(block_store_client, block_store, "Blob operations", "Direct")
+
+' Data flow from Block Persister
+
+Rel(block_persister, block_store, "Produces enriched block files", "Direct")
+
+' Administrative monitoring (Server provides Health() method for health checks)
+
+SHOW_LEGEND()
+
+@enduml
